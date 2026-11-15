@@ -4,6 +4,7 @@
 
 static inline uint16_t vram16(const VDP& v, uint32_t a) { a &= 0xFFFE; return uint16_t(v.vram[a] << 8 | v.vram[a + 1]); }
 
+
 // ---- the ports ----
 
 uint16_t MD::vdp_read(uint32_t a) {
@@ -20,8 +21,8 @@ uint16_t MD::vdp_read(uint32_t a) {
         vdp.addr = uint16_t(vdp.addr + vdp.reg[15]);
         return r;
     }
-    case 0x04: return vdp_status();
-    case 0x08: case 0x0C: return vdp_hv();
+    case 0x04: sv.status_reads++; return vdp_status();
+    case 0x08: case 0x0C: sv.hv_reads++; return vdp_hv();
     default: return 0xFFFF;
     }
 }
@@ -45,7 +46,7 @@ uint16_t MD::vdp_status() {
     const uint16_t s = 0x3400 | 0x200
         | (vdp.vint_pending ? 0x80 : 0) | (vdp.sprite_ovf ? 0x40 : 0) | (vdp.sprite_col ? 0x20 : 0)
         | (vdp.odd_frame ? 0x10 : 0) | (vb ? 8 : 0) | (pos >= HBLANK_T ? 4 : 0)
-        | (n < vdp.dma_end || vdp.fill_pending ? 2 : 0) | (pal ? 1 : 0);
+        | (pal ? 1 : 0);
     vdp.sprite_ovf = vdp.sprite_col = false;
     return s;
 }
@@ -81,7 +82,8 @@ void MD::vdp_ctrl_write(uint16_t v) {
         const int r = (v >> 8) & 0x1F;
         if (!(vdp.reg[1] & 4) && r > 10) return;      // mode 4: only registers 0-10
         vdp.reg[r] = uint8_t(v);
-        if (r == 0 || r == 1) update_irq();
+        if (!vdp.vblank && (vdp.reg[1] & 0x40)) sv.reg_active++;
+        if (r == 0 || r == 1) irq_reg_written(r);
         vdp.code = 0;
         vdp.addr = 0;
         return;
@@ -120,38 +122,17 @@ void MD::vdp_data_write(uint16_t data) {
             vdp.addr = uint16_t(vdp.addr + vdp.reg[15]);
         }
         vdp.reg[19] = vdp.reg[20] = 0;
-        // the fill runs on its own: about 17 bytes a line in H40 active display, 204 in blanking
-        vdp.dma_end = now() + uint64_t(len + 1) * LINE_T / (vdp.vblank ? 204 : 17);
         return;
     }
     switch (vdp.code & 0xF) {
     case 0x1: vram_write_word(*this, data); break;
-    case 0x3: vdp.cram[(vdp.addr & 0x7E) >> 1] = data & 0xEEE; break;
-    case 0x5: if (((vdp.addr & 0x7E) >> 1) < 40) vdp.vsram[(vdp.addr & 0x7E) >> 1] = data & 0x7FF; break;
+    case 0x3: vdp.cram[(vdp.addr & 0x7E) >> 1] = data & 0xEEE; if (!vdp.vblank && (vdp.reg[1] & 0x40)) sv.cram_active++; break;
+    case 0x5: if (((vdp.addr & 0x7E) >> 1) < 40) vdp.vsram[(vdp.addr & 0x7E) >> 1] = data & 0x7FF;
+              if (!vdp.vblank && (vdp.reg[1] & 0x40)) sv.vsram_active++;
+              break;
     default: return;
     }
     vdp.addr = uint16_t(vdp.addr + vdp.reg[15]);
-}
-
-// the ticks a 68000 to VDP DMA of `words` takes from now: the slots of each line,
-// 18 (H40) or 16 (H32) in active display, 205 or 167 in blanking (Charles MacDonald's figures)
-static uint64_t dma_ticks(MD& m, uint32_t words) {
-    const bool h40 = m.vdp_h40();
-    const int act = m.vdp_active_lines();
-    uint64_t tt = m.now();
-    uint32_t left = words;
-    int l = m.line;
-    uint64_t lt = m.line_t;
-    while (tt >= lt + LINE_T) { lt += LINE_T; l = (l + 1) % m.lines; }
-    while (left) {
-        const bool active = l < act && (m.vdp.reg[1] & 0x40);
-        const uint32_t per = active ? (h40 ? 18 : 16) : (h40 ? 205 : 167);
-        const uint64_t rest = lt + LINE_T - tt;
-        const uint32_t can = uint32_t((per * rest + LINE_T - 1) / LINE_T);
-        if (left <= can) { tt += uint64_t(left) * LINE_T / per; left = 0; }
-        else { left -= can; tt = lt + LINE_T; lt += LINE_T; l = (l + 1) % m.lines; }
-    }
-    return tt - m.now();
 }
 
 void MD::vdp_dma() {
@@ -159,39 +140,45 @@ void MD::vdp_dma() {
     const int type = vdp.reg[23] >> 6;
     uint32_t len = vdp.reg[19] | (vdp.reg[20] << 8);
     if (type <= 1) {
-        // 68000 memory to VRAM, CRAM or VSRAM; the 68000 stops for the length of it
-        if (!len) len = 0x10000;
+        // 68000 memory to VRAM, CRAM or VSRAM, at once, as MAME does it: the length in
+        // bytes in 16 bits (0 is $FFFF), the source on past $FFFFFF to the RAM, the
+        // 68000 paused length / 3.5 ns for VRAM (MAME's stand-in for the real timing),
+        // not at all for CRAM and VSRAM; a VSRAM transfer stops past its end
+        uint16_t bytes = uint16_t(len << 1);
+        if (!bytes) bytes = 0xFFFF;
+        const uint32_t n = bytes >> 1;
         uint32_t src = (vdp.reg[21] | (vdp.reg[22] << 8) | ((vdp.reg[23] & 0x7F) << 16)) << 1;
-        const uint64_t ticks = dma_ticks(*this, len);
-        for (uint32_t i = 0; i < len; i++) {
+        const int what = vdp.code & 0xF;
+        if (what != 1 && what != 3 && what != 5) return;
+        for (uint32_t i = 0; i < n; i++) {
+            if (what == 5 && vdp.addr >= 0x80) return;
             const uint16_t w = bus_r16(cpu, src);
-            switch (vdp.code & 0xF) {
-            case 0x1: vram_write_word(*this, w); break;
-            case 0x3: vdp.cram[(vdp.addr & 0x7E) >> 1] = w & 0xEEE; break;
-            case 0x5: if (((vdp.addr & 0x7E) >> 1) < 40) vdp.vsram[(vdp.addr & 0x7E) >> 1] = w & 0x7FF; break;
-            }
+            if (what == 1) vram_write_word(*this, w);
+            else if (what == 3) { vdp.cram[(vdp.addr & 0x7E) >> 1] = w & 0xEEE; if (!vdp.vblank && (vdp.reg[1] & 0x40)) sv.cram_active++; }
+            else if (((vdp.addr & 0x7E) >> 1) < 40) vdp.vsram[(vdp.addr & 0x7E) >> 1] = w & 0x7FF;
             vdp.addr = uint16_t(vdp.addr + vdp.reg[15]);
-            // the source counts within 128 KB: its top bits do not carry
-            src = (src & 0xFE0000) | ((src + 2) & 0x1FFFF);
+            src += 2;
+            if (src > 0xFFFFFF) src = what == 1 ? 0xE00000 : 0xFE0000;
         }
-        dma_words += len;
+        dma_words += n;
         vdp.reg[19] = vdp.reg[20] = 0;
-        vdp.reg[21] = uint8_t(src >> 1); vdp.reg[22] = uint8_t(src >> 9);
-        cpu.cyc += int((ticks + CPU_T - 1) / CPU_T);
+        vdp.reg[21] = uint8_t(src >> 1); vdp.reg[22] = uint8_t(src >> 9); vdp.reg[23] = uint8_t(src >> 17);
+        if (what == 1) {
+            const double mclk = pal ? 53203424.0 : 53693175.0;
+            const uint64_t ticks = uint64_t(double(bytes) * 1000.0 / 3500.0 * mclk / 1e9);
+            cpu.cyc += int((ticks + CPU_T - 1) / CPU_T);
+        }
     } else if (type == 2) {
         vdp.fill_pending = true;        // the data port's next word starts it
     } else {
-        // VRAM copy: byte by byte, the source in registers 21-22
+        // VRAM copy: byte by byte, the source in registers 21-22 (MAME's: a length of 0
+        // copies nothing, and the registers are left as they were)
         uint16_t src = uint16_t(vdp.reg[21] | (vdp.reg[22] << 8));
-        if (!len) len = 0x10000;
         for (uint32_t i = 0; i < len; i++) {
             vdp.vram[vdp.addr] = vdp.vram[src];
             src++;
             vdp.addr = uint16_t(vdp.addr + vdp.reg[15]);
         }
-        vdp.reg[19] = vdp.reg[20] = 0;
-        vdp.reg[21] = uint8_t(src); vdp.reg[22] = uint8_t(src >> 8);
-        vdp.dma_end = now() + uint64_t(len) * LINE_T / (vdp.vblank ? 102 : 9);
     }
 }
 
@@ -249,7 +236,7 @@ static void window_line(const VDP& v, int y, int w, bool h40, uint8_t* col, uint
     }
 }
 
-static void sprite_line(VDP& v, int y, int w, bool h40, uint8_t* col, uint8_t* pri) {
+static int sprite_line(VDP& v, int y, int w, bool h40, uint8_t* col, uint8_t* pri) {
     const int max_spr = h40 ? 80 : 64, max_line = h40 ? 20 : 16, max_px = h40 ? 320 : 256;
     const uint32_t sat = h40 ? uint32_t(v.reg[5] & 0x7E) << 9 : uint32_t(v.reg[5] & 0x7F) << 9;
     int list[20], n = 0, idx = 0;
@@ -258,14 +245,14 @@ static void sprite_line(VDP& v, int y, int w, bool h40, uint8_t* col, uint8_t* p
         const int sy = (w0 & 0x1FF) - 128, vsz = ((w1 >> 8) & 3) + 1;
         if (y >= sy && y < sy + vsz * 8) {
             if (n < max_line) list[n++] = idx;
-            else { v.sprite_ovf = true; break; }
+            else { v.sprite_ovf = true; n++; break; }
         }
         idx = w1 & 0x7F;
         if (!idx || idx >= max_spr) break;
     }
     int budget = max_px;
     bool masked = false, seen_x = false;
-    for (int k = 0; k < n && budget > 0; k++) {
+    for (int k = 0; k < n && k < max_line && budget > 0; k++) {
         const int s = list[k];
         const uint16_t w1 = v.sat_cache[(s * 4 + 1) & 0x1FF];
         const int sy = (v.sat_cache[(s * 4) & 0x1FF] & 0x1FF) - 128;
@@ -290,6 +277,7 @@ static void sprite_line(VDP& v, int y, int w, bool h40, uint8_t* col, uint8_t* p
             pri[x] = uint8_t(w2 >> 15);
         }
     }
+    return n;
 }
 
 // a CRAM colour (or the backdrop) at an intensity: 0 shadow, 1 normal, 2 highlight
@@ -315,7 +303,9 @@ void MD::vdp_render_line(int y) {
     plane_line(v, 1, y, w, bc, bp);
     plane_line(v, 0, y, w, ac, ap);
     window_line(v, y, w, h40, ac, ap);
-    sprite_line(v, y, w, h40, sc, sp);
+    const int ns = sprite_line(v, y, w, h40, sc, sp);
+    if (ns > int(sv.spr_line_max)) sv.spr_line_max = uint32_t(ns);
+    if (ns > (h40 ? 20 : 16)) sv.spr_ovf_lines++;
     const bool sh = v.reg[12] & 8;
     for (int x = 0; x < w; x++) {
         int c, level = 1;

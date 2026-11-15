@@ -7,7 +7,7 @@
 //
 // The VDP works a line at a time, at fixed points of the line: the line is drawn at
 // its tick 0 (with the registers, VRAM, CRAM and VSRAM of that moment), the HINT
-// counter steps and HINT is raised at the start of the blanking (HBLANK_T), VINT and
+// counter steps and HINT is raised at the line's end (HINT_T), VINT and
 // the vertical blanking start at tick 0 of line 224 (240 in V30).  The Z80, the YM2612's
 // timers and the pads are brought up to the present whenever the 68000 touches them,
 // and at every event.
@@ -19,18 +19,37 @@
 #include <cstdint>
 #include <cstring>
 #include <vector>
+#include <string>
+#include <map>
 #include "m68k.h"
 #include "z80.h"
+#include "md_cart.h"
+#include "md_sound.h"
 
 enum {
     LINE_T = 3420,              // ticks per line
     ACTIVE_T = 2560,            // the active display's ticks
-    HBLANK_T = 2640,            // where HINT comes and the HBlank flag rises (about H counter $A5 in H40)
+    HBLANK_T = 2640,            // where the HBlank flag rises and V steps (about H counter $A5 in H40)
+#ifndef HINT_AT
+#define HINT_AT 3420
+#endif
+    // where the HINT counter steps and HINT is raised: at the line's end, the phase of VINT
+    // (MAME raises both in its scanline callback; held to MAME, more of the library agrees
+    // than with HINT at the blanking's start)
+    HINT_T = HINT_AT,
     CPU_T = 7, Z80_T = 15,
+    IRQ_RISE_T = 128, IRQ_ENABLE_T = 64, IRQ_SAMPLE_T = 4 * 7,
     MAX_W = 320, MAX_H = 240,
 };
 
 enum Machine { M_NTSC_U, M_NTSC_J, M_PAL };
+constexpr uint64_t NEVER = ~0ull;
+
+// the hardware the 68000's I/O reaches, by class (the tracer's access sites: two bits each,
+// read and write); io_class() in md_core.cpp
+enum IoClass { IOC_CART, IOC_Z80RAM, IOC_YM, IOC_VERSION, IOC_PAD, IOC_Z80BUS, IOC_MAPPER, IOC_TMSS,
+               IOC_VDPDATA, IOC_VDPCTRL, IOC_HV, IOC_PSG, IOC_OTHER, IOC_N };
+int io_class(uint32_t a);
 
 struct VDP {
     uint8_t vram[0x10000];
@@ -42,16 +61,34 @@ struct VDP {
     uint16_t cmd1;
     bool fill_pending;          // a VRAM fill waits for its data word
     bool vint_pending, hint_pending, vblank;
+    // the interrupt lines to the 68000: the tick each rose (NEVER: low).  MAME's VDP raises
+    // a line 128 ticks after the interrupt becomes pending (64 after an enable bit is set
+    // over a pending one) and drops it at once; the 68000 samples it at the start of an
+    // instruction's last prefetch, so a line is taken at a boundary 4 cycles past its rise
+    uint64_t vint_line, hint_line;
     int hint_counter;
     bool sprite_ovf, sprite_col;
     bool odd_frame;
-    uint64_t dma_end;           // fill and copy run while the 68000 goes on: busy until here
     // the frame being drawn
     uint32_t fb[MAX_W * MAX_H]; // xRGB
     int width, height;          // of the frame (320 or 256; 224 or 240)
     // ... and the last whole frame
     uint32_t out[MAX_W * MAX_H];
     int out_w, out_h;
+};
+
+// what the library does with the machine (the survey's columns, for the Jaguar side): counts only
+struct Survey {
+    uint32_t frames, h40, h32, v30, interlace, shadow, window, display_off, vs_column;
+    uint32_t hs_mode[4];                 // full, (invalid), per cell, per line
+    uint32_t spr_line_max, spr_ovf_lines;
+    uint64_t dma_words;
+    uint32_t dma_frame_max, hint_frame_max, hint_frames;
+    uint32_t cram_active, vsram_active, reg_active;     // writes while the display draws
+    uint32_t status_reads, hv_reads;
+    uint32_t z80_uploads;                // the Z80 let out of reset
+    uint64_t z80_hash;                   // its RAM (the sound driver) when last let out
+    uint8_t ym27;                        // YM2612 register $27's bits ever set: timers, CSM, channel 3 mode
 };
 
 struct Pad {
@@ -68,6 +105,7 @@ struct YM {
     uint64_t ta_next, tb_next;  // the ticks of the timers' next overflows (0: stopped)
     uint8_t status;             // the overflow flags as last updated
     uint32_t writes;            // data writes (for the survey)
+    uint32_t writes_68k, keyons, dac_writes, psg_writes, psg_writes_68k;   // ... by whom and what
 };
 
 struct PSG {
@@ -98,15 +136,17 @@ struct MD {
     uint64_t line_t = 0;        // the tick the line began
     bool line_drawn = false, line_hblank = false;
     bool frame_done = false;    // a frame ended at the last event
+    uint64_t irq_next = NEVER;  // the tick an interrupt line becomes visible to the 68000
 
     // ---- memory ----
     std::vector<uint8_t> rom;   // the cartridge, as the list has it
     uint8_t ram[0x10000];
     uint8_t zram[0x2000];
-    std::vector<uint8_t> sram;
-    bool sram_on = false;       // $A130F1
+    std::vector<uint16_t> sram; // the save memory (SRAM or FRAM), in 16-bit words
+    bool sram_on = false, sram_ro = false;     // $A130F1: in view, read-only
+    bool sram_fram = false;
     uint32_t sram_start = 0x200000, sram_end = 0x20FFFF;
-    bool sram_odd = true;       // only the odd bytes (8-bit SRAM on the low lane)
+    uint32_t rom_bytes = 0;     // the image's own size
 
     // ---- the Z80 side ----
     Z80 z80;
@@ -119,21 +159,41 @@ struct MD {
 
     YM ym;
     PSG psg;
+    Sound sound;                // the WAV and VGM outputs, when asked for
+    bool z80_running = false;   // inside z80_sync: the Z80's accesses are at zt
     VDP vdp;
-    Pad pad[2];
+    Pad pad[4];                 // 3 and 4: the J-Cart's
+    CartHW cart;
     uint8_t io_ext_data = 0, io_ext_ctrl = 0;
 
     // ---- counters (for the survey) ----
+    Survey sv;
+    uint32_t sv_hints0 = 0, sv_hints_on = 0;   // HINTs raised while enabled
     uint64_t dma_words = 0;     // 68000 to VDP DMA, words, this frame
     uint32_t hints = 0, vints = 0;
 
-    void init(const std::vector<uint8_t>& rom_image, Machine m, uint32_t sram_bytes);
+    void init(const std::vector<uint8_t>& rom_image, Machine m, uint32_t sram_bytes, const std::string& slot = "rom");
     void reset();
     // run until the end of the current frame (interpreted)
     void run_frame();
+    // ... the recompiled code where there is some (md_native.h), the interpreter elsewhere
+    void run_frame_native();
+    uint64_t n_native = 0, n_interp = 0;        // instructions run each way
+    std::vector<uint8_t>* cover = nullptr;
+    std::map<uint32_t, uint32_t>* sites = nullptr;  // the tracer's: instruction -> the I/O classes it reached
+    std::vector<std::pair<uint32_t, uint64_t>>* steplog = nullptr;  // --steplog: (pc, t) of each instruction      // the tracer's: the instruction starts run, by pc / 2
     // the events due at t: lines, interrupts; sets next
     void events();
-    void update_irq();
+    void update_irq();          // the 68000's level from the lines, as seen at the boundary t
+    void irq_ack();
+    void irq_reg_written(int r);  // VDP register 0 or 1 written: an enable over a pending interrupt
+
+    // ---- the cartridge's hardware (md_cart.cpp) ----
+    void cart_map();
+    void ssf2_bank(int slot, int bank);
+    bool cart_r16(uint32_t a, uint16_t& v);
+    void cart_w16(uint32_t a, uint16_t data, uint16_t mask);
+    void cart_a13_w(uint32_t a, uint8_t v);
 
     // the I/O side of the 68000's bus
     uint8_t io_r8(uint32_t a);
@@ -165,5 +225,9 @@ struct MD {
     void vdp_end_frame();
     int vdp_active_lines() const { return (vdp.reg[1] & 8) && pal ? 240 : 224; }
     bool vdp_h40() const { return vdp.reg[12] & 1; }
+    // what the 68000's data bus holds where nothing drives it: the word it prefetched
+    uint16_t open_bus() { const uint8_t* p = cpu.rpage[(cpu.pc >> 16) & 0xFF]; return p ? bus_r16(cpu, cpu.pc & ~1u) : 0xFFFF; }
+    // the time of an access to the sound chips: the Z80's own while it runs
+    uint64_t bus_time() const { return z80_running ? zt : now(); }
     uint64_t now() const { return t + uint64_t(cpu.cyc) * CPU_T; }
 };

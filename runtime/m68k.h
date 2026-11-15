@@ -218,6 +218,14 @@ uint32_t m68k_get_usp(const M68K& c);
 uint32_t m68k_get_ssp(const M68K& c);
 void m68k_set_sps(M68K& c, uint32_t usp, uint32_t ssp);
 
+// the handlers, by opcode: each runs one instruction from c.ir, its extension words
+// fetched at c.pc (the recompiled code calls them as the interpreter does)
+typedef void (*M68KHandler)(M68K&);
+extern M68KHandler m68k_op[65536];
+void m68k_init();               // build the table
+// an address error raised in an instruction: the group 0 frame (a second one halts)
+void m68k_fault(M68K& c, const AddressError& e);
+
 // the reset exception: supervisor, level 7, SSP and PC from vectors 0 and 1
 void m68k_reset(M68K& c);
 // ask for interrupt level 0-7 (level 7 is taken on its rising edge)

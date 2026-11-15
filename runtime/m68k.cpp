@@ -5,8 +5,8 @@
 // 68000's, as MAME's microcoded core counts them.
 #include "m68k.h"
 
-typedef void (*Handler)(M68K&);
-static Handler table[65536];
+M68KHandler m68k_op[65536];         // the handlers by opcode (the recompiled code calls them too)
+#define table m68k_op
 static bool table_built;
 
 // ---- status register ----
@@ -812,7 +812,7 @@ static bool ea_ok(int mode, int reg, int allowed) {
     const int bit = mode < 7 ? 1 << mode : reg <= 4 ? 128 << reg : 0;
     return bit & allowed;
 }
-static void set(int op, Handler h, int allowed) {
+static void set(int op, M68KHandler h, int allowed) {
     if (ea_ok((op >> 3) & 7, op & 7, allowed)) table[op] = h;
 }
 
@@ -917,6 +917,12 @@ static void build() {
         }
     }
     table_built = true;
+}
+
+void m68k_init() { if (!table_built) build(); }
+
+void m68k_fault(M68K& c, const AddressError& e) {
+    try { group0(c, e); } catch (const AddressError&) { c.halted = true; }
 }
 
 bool m68k_legal(uint16_t op) {
