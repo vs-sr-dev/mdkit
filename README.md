@@ -134,13 +134,28 @@ python tools/z80_families.py --write-exports                  # the Z80 drivers,
   register or the RAM; a copy between address registers keeps the load it
   copies, an offset or an increment the register's own) is counted when
   that register forms an address in work RAM: the sites a relocation has
-  to fix, with the origin of the value. The tracer also
-  writes the Z80's code: each byte of its RAM it ran, and its value.
+  to fix, with the origin of the value; and each instruction that takes
+  such an address out of the address registers (to a data register, to
+  memory, into a compare). The tracer also writes the Z80's code: each
+  byte of its RAM it ran, and its value.
+- The same build probes what a port has to keep where it puts things of
+  its own: every read of the header's first long (`$100-$103`, where
+  the Jaguar's one interrupt vector sits), by the CPU or by DMA; every
+  read of the 1024 bytes under the stack pointer, by the CPU or by a DMA
+  to the VDP, with how deep, and every read of a stale local -- a byte
+  that has been under the stack pointer since it was last written (the
+  reads CLR, Scc and MOVE from SR make and drop are not counted); every
+  instruction that loads A7 itself (a task's stack); and where the code
+  run from the work RAM came from -- the ROM bytes it copies and the
+  instruction that copied them, or none (decompressed, built) -- and
+  whether it is rewritten while it runs.
 - `tools/cover.py`: runs the tracer several times (tapes, the hand with
   seeds 1-3, the attract mode with no input) and keeps their union as
   `trace.cov` (and `.sites`, `.taint`, `.z80`), the runs in `runs/` and
   `runs.json`, and writes `export.json` from it with `ram_pointers`,
-  `immediates`, `an_loads`, `unattributed`, `z80_code` and `runs`. Runs
+  `immediates`, `an_loads`, `an_exits`, `unattributed`, `header_reads`,
+  `sub_sp_reads`, `stack_loads`, `ram_code` (with its origin), `z80_code`
+  and `runs`. Runs
   made before (a cart's tapes) stay in the union when the library's are
   made again.
 
@@ -169,6 +184,18 @@ Recompiled from the four runs, the library is 21.7 million instructions
 (17.6 million from the hand alone, median a cart 12,790 against 10,271),
 and all 1349 carts are identical to the interpreter in lockstep with a
 fifth hand (seed 4) for 6000 frames.
+
+What the probes find in the library, from the same four runs: 189 carts
+read the header's first long (307 instructions, 30 of them DMAs) -- most
+of them EA's checksum, `add.l (A0)+,D0` from `$100`; 556 carts read under
+their stack pointer with the CPU and 152 by DMA, 98 of them within 64
+bytes of it (Steel Empire, Death Duel and Turbo Out Run hand the VDP a
+buffer that ends 2 bytes under it), and 404 read a stale local; 128 load
+A7 from one instruction with more than one value, a stack per task
+(Sparkster's `movea.w D0,A7`, sixteen stacks; Comix Zone's, six million
+switches). The 347 carts' code in RAM is 944 groups: 296 copied from the
+ROM as they are, 449 written from no ROM bytes (decompressed or built),
+198 mixed; in 166 carts some of it is rewritten while it runs.
 
 ## The library
 

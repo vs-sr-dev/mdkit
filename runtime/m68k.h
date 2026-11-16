@@ -108,7 +108,12 @@ inline uint16_t fetch(M68K& c) {
 }
 inline uint32_t fetch32(M68K& c) { const uint32_t hi = fetch(c); return hi << 16 | fetch(c); }
 
-inline uint32_t rd8(M68K& c, uint32_t a) { c.cyc += 4; return bus_r8(c, a); }
+inline uint32_t rd8(M68K& c, uint32_t a) {
+    c.cyc += 4;
+    const uint32_t v = bus_r8(c, a);
+    TAINT(taint_read(c, a, 1, v);)
+    return v;
+}
 inline uint32_t rd16(M68K& c, uint32_t a) {
     if (a & 1) address_error(c, a, true, false, data_fc(c));
     c.cyc += 4;
@@ -124,7 +129,11 @@ inline uint32_t rd32(M68K& c, uint32_t a) {
     TAINT(taint_read(c, a, 4, v);)
     return v;
 }
-inline void wr8(M68K& c, uint32_t a, uint32_t v) { c.cyc += 4; bus_w8(c, a, uint8_t(v)); }
+inline void wr8(M68K& c, uint32_t a, uint32_t v) {
+    c.cyc += 4;
+    TAINT(taint_write(c, a, 1, v);)
+    bus_w8(c, a, uint8_t(v));
+}
 inline void wr16(M68K& c, uint32_t a, uint32_t v) {
     if (a & 1) address_error(c, a, false, false, data_fc(c));
     c.cyc += 4;

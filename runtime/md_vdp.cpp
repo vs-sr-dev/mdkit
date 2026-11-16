@@ -152,6 +152,7 @@ void MD::vdp_dma() {
         if (what != 1 && what != 3 && what != 5) return;
         for (uint32_t i = 0; i < n; i++) {
             if (what == 5 && vdp.addr >= 0x80) return;
+            TAINT(taint_dma(cpu, src);)
             const uint16_t w = bus_r16(cpu, src);
             if (what == 1) vram_write_word(*this, w);
             else if (what == 3) { vdp.cram[(vdp.addr & 0x7E) >> 1] = w & 0xEEE; if (!vdp.vblank && (vdp.reg[1] & 0x40)) sv.cram_active++; }

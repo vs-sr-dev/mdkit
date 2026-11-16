@@ -36,8 +36,32 @@ order of md.h's IoClass).  The JSON:
   word or the immediate, as in ram_pointers and immediates; none: made from no ROM word);
 - "unattributed": PCs that formed a work RAM address from a register no ROM word reached, and
   the PC that last wrote that register ("written_at"; $FFFFFF: an exception's entry);
+- "an_exits": the complement of an_loads -- every instruction that took a work RAM address out of
+  an address register: into a data register ("data": move.l An,Dn, exg), to memory ("memory":
+  move.l An,(..), movem, pea (An)), or compared ("compare": cmp.l An,Dn); its PC and text, the
+  register, how many times;
+- "header_reads": every read of the header's first long, $100-$103, which a port that puts
+  its own vector there has to serve with the original bytes: the PC and text, the address and
+  size read, the operand's addressing mode, "cpu" or "dma", how many times;
+- "sub_sp_reads": every read of the work RAM in the 1024 bytes under the stack pointer, by the
+  CPU (against A7 before the instruction) or by a DMA to the VDP (A7 then), with the shallowest
+  and deepest distance under A7 ("min_depth", "max_depth"); and as "stale_local" every read at
+  or above A7 of a byte that has been under A7 since it was last written -- written there, or
+  left there by a return (RTS, UNLK, RTE, a pop: A7 back up by up to 1024 bytes) -- with its
+  distance above A7 ("min_above", "max_above") and the PC that last wrote it ("written_at",
+  $FFFFFF: an exception's entry).  How deep a port's own code can go under the game's stack;
+- "stack_loads": every instruction that loads A7 itself (MOVEA, LEA not off A7, EXG, MOVEM
+  naming A7): its PC and text, how many times, the values in 32 bits (lea $1000000,A7 is the
+  top of the RAM; up to 16), their range and the longest jump of A7 in 24 bits: the stack
+  switches (a task's stack loaded from a variable is one);
 - "ram_code": the instructions the runs ran from the work RAM (code copied there; jsr $c500.w
   runs $FFC500): their count and their PCs in groups, [first, last] with no gap over 16 bytes;
+  and for each group ("groups"): how many instructions it ran, where its bytes came from
+  ("copied": each instruction's bytes are ROM bytes at one distance, "rom" the ROM range
+  [first, last] of the instructions' starts; "generated": written from no ROM bytes,
+  decompressed or built; "mixed"), the PCs that copied or wrote them ("copy_pcs"), and whether
+  each instruction ran with one encoding only ("stable"; "variants": the most a PC had, up to
+  8) -- code copied once, or rewritten while it runs;
 - "z80_code": the Z80's code the runs saw it run from its RAM (FILE.z80): the bytes, their
   CRC32 (the driver's fingerprint, code only: its variables and the music data are not in it)
   and the runs of consecutive bytes as [first, hex bytes];
@@ -174,6 +198,111 @@ def pointers(data, prog, covers):
     return ram, imm, un, an
 
 
+def read_probes(paths):
+    """The probes' records of one or more .taint files (md_taint.h), merged as tools/cover.py merges them."""
+    header, sub, stack, ram_pcs, exits = Counter(), {}, {}, {}, Counter()
+    for p in paths:
+        if not os.path.exists(p):
+            continue
+        for ln in open(p):
+            w = ln.split()
+            if not w or w[0] == '#':
+                continue
+            if w[0] == 'H':
+                header[(int(w[1], 16), int(w[2]), int(w[3], 16), int(w[4]))] += int(w[5])
+            elif w[0] == 'S':
+                lo, hi, n, at = int(w[3]), int(w[4]), int(w[5]), int(w[6], 16)
+                o = sub.get((int(w[1], 16), int(w[2])))
+                if o is None:
+                    sub[(int(w[1], 16), int(w[2]))] = [lo, hi, n, at]
+                else:
+                    o[0] = min(o[0], lo)
+                    if hi > o[1]:
+                        o[1], o[3] = hi, at
+                    o[2] += n
+            elif w[0] == 'K':
+                o = stack.setdefault(int(w[1], 16), [0, 0xFFFFFFFF, 0, 0, set()])
+                o[0] += int(w[2])
+                o[1] = min(o[1], int(w[3], 16))
+                o[2] = max(o[2], int(w[4], 16))
+                o[3] = max(o[3], int(w[5], 16))
+                if len(w) > 6:
+                    o[4] |= {int(v, 16) for v in w[6].split(',')}
+            elif w[0] == 'R':
+                o = ram_pcs.setdefault(int(w[1], 16), [0, 0, set(), set()])
+                o[0] += int(w[2])
+                o[1] = o[1] or int(w[3], 16)
+                o[2] |= set(w[4].split(','))
+                o[3] |= {None if v == '-' else int(v, 16) for v in w[5].split(',')}
+            elif w[0] == 'X':
+                exits[(int(w[1], 16), int(w[2]), w[3])] += int(w[4])
+    return header, sub, stack, ram_pcs, exits
+
+
+VIA = ('cpu', 'dma', 'stale_local')
+TO = dict(d='data', m='memory', c='compare')
+
+
+def probes(data, prog, covers, ram_groups):
+    """header_reads, sub_sp_reads, stack_loads, an_exits and the origin of each group of ram_code."""
+    from mdkit import m68k
+    header, sub, stack, ram_pcs, exits = read_probes([cv + '.taint' for cv in covers])
+    read16 = m68k.reader(data)
+
+    def insn(pc):
+        i = prog.code.get(pc)
+        if i is None and pc < min(len(data), 0x400000):
+            i = m68k.decode(read16, pc)
+        return i
+
+    def text(pc):
+        i = insn(pc)
+        return i.text() if i else None
+
+    hdr = []
+    for (pc, via, addr, size), n in sorted(header.items()):
+        i = insn(pc)
+        mem = [o for o in i.ops if getattr(o, 'memory', False)] if i else []
+        hdr.append(dict(pc=pc, text=i.text() if i else None, address=addr, size=size,
+                        mode=mem[0].kind if mem and via == 0 else None, via=VIA[via], count=n))
+    def dummy(pc):
+        """CLR, Scc, MOVE from SR: a read the 68000 makes and drops (tracers before md_taint.cpp knew)."""
+        if pc >= min(len(data), 0x400000):
+            return False
+        op = read16(pc)
+        return (op & 0xFF00) == 0x4200 or ((op & 0xF0C0) == 0x50C0 and (op >> 3) & 7 != 1) or (op & 0xFFC0) == 0x40C0
+
+    sp = []
+    for (pc, via), (lo, hi, n, at) in sorted(sub.items()):
+        if via != 1 and dummy(pc):
+            continue
+        rec = dict(pc=pc, text=text(pc), via=VIA[via], count=n)
+        if via < 2:
+            rec.update(min_depth=lo, max_depth=hi)
+        else:
+            rec.update(min_above=lo, max_above=hi, written_at=at, written_text=text(at))
+        sp.append(rec)
+    loads = [dict(pc=pc, text=text(pc), count=n, min=lo, max=hi, max_jump=jump, values=sorted(vals))
+             for pc, (n, lo, hi, jump, vals) in sorted(stack.items())]
+    out = [dict(pc=pc, text=text(pc), reg=f'A{an}', to=TO[to], count=n) for (pc, an, to), n in sorted(exits.items())]
+    groups = []
+    for first, last in ram_groups:
+        pcs = [p for p in sorted(ram_pcs) if first <= p <= last]
+        srcs = [ram_pcs[p][3] for p in pcs]
+        deltas = {next(iter(s)) - p for p, s in zip(pcs, srcs) if len(s) == 1 and None not in s}
+        if pcs and all(len(s) == 1 and None not in s for s in srcs) and len(deltas) == 1:
+            how, d = 'copied', deltas.pop()
+            rom = [first + d, last + d]
+        else:
+            how = 'generated' if pcs and all(s == {None} for s in srcs) else 'mixed' if pcs else None
+            rom = None
+        variants = max((len(ram_pcs[p][2]) for p in pcs), default=0)
+        groups.append(dict(first=first, last=last, executed=sum(ram_pcs[p][0] for p in pcs), source=how, rom=rom,
+                           copy_pcs=sorted({ram_pcs[p][1] for p in pcs} - {0}), stable=variants <= 1,
+                           variants=variants))
+    return hdr, sp, loads, out, groups
+
+
 def z80_code(covers):
     """The Z80 RAM bytes run as code (FILE.z80), merged: count, CRC32, runs of consecutive bytes."""
     code = {}
@@ -254,6 +383,7 @@ def export(rom_path, covers):
             ram_groups[-1][1] = a
         else:
             ram_groups.append([a, a])
+    header_reads, sub_sp_reads, stack_loads, an_exits, ram_origin = probes(data, prog, covers, ram_groups)
     return dict(
         cart=dict(key=c.key, title=c.title, machine=c.machine, slot=c.slot, size=c.size,
                   crc32=f'{zlib.crc32(data):08X}'),
@@ -269,7 +399,11 @@ def export(rom_path, covers):
         immediates=immediates,
         an_loads=an_loads,
         unattributed=unattributed,
-        ram_code=dict(instructions=sum(1 for p in run_pcs if p >= 0xE00000), pcs=ram_groups),
+        an_exits=an_exits,
+        header_reads=header_reads,
+        sub_sp_reads=sub_sp_reads,
+        stack_loads=stack_loads,
+        ram_code=dict(instructions=sum(1 for p in run_pcs if p >= 0xE00000), pcs=ram_groups, groups=ram_origin),
         z80_code=z80_code(covers))
 
 

@@ -4,7 +4,7 @@ Each run is build/md_taint.exe with --cover (md.exe's tracer, with the pointers'
 beside it): a tape (md.exe --tape), the random hand with a seed, or no input at all (the
 attract mode: the title and the demos).  The runs' files stay in OUT/runs/; their union is
 OUT/trace.cov (the instructions), trace.cov.sites (the access sites, their classes or-ed),
-trace.cov.taint (the origins, their flags or-ed and their uses summed) and trace.cov.z80
+trace.cov.taint (the origins, their flags or-ed and their uses summed; the probes merged) and trace.cov.z80
 (the Z80's code: each RAM byte it ran, the first run's value), and
 OUT/export.json is written from it (recomp/export.py, with the runs listed).
 
@@ -67,6 +67,7 @@ def run(exe, rom, flags, name, args, runs_dir):
 def merge(runs_dir, names, out_cov):
     """The union of the runs' files as out_cov, .sites and .taint; each run's own count."""
     pcs, sites, origins, unattr, z80, loads = set(), {}, {}, {}, {}, {}
+    header, sub, stack, ram_pcs, exits = {}, {}, {}, {}, {}
     per_run = {}
     for n in names:
         p = os.path.join(runs_dir, n + '.cov')
@@ -101,6 +102,36 @@ def merge(runs_dir, names, out_cov):
                         ld[1] = w[4]
                     if ld[2] == '000000' and w[5] != '000000':
                         ld[2:] = w[5:8]
+                elif w[0] == 'H':                   # the header's first long read: PC VIA ADDR SIZE COUNT
+                    k = tuple(w[1:5])
+                    header[k] = header.get(k, 0) + int(w[5])
+                elif w[0] == 'S':                   # under A7: PC VIA MIN MAX COUNT WRITTEN_AT
+                    lo, hi, n = int(w[3]), int(w[4]), int(w[5])
+                    o = sub.get((w[1], w[2]))
+                    if o is None:
+                        sub[(w[1], w[2])] = [lo, hi, n, w[6]]
+                    else:
+                        o[0] = min(o[0], lo)
+                        if hi > o[1]:
+                            o[1], o[3] = hi, w[6]
+                        o[2] += n
+                elif w[0] == 'K':                   # A7 loaded: PC COUNT LO HI JUMP VALUES
+                    o = stack.setdefault(w[1], [0, 0xFFFFFFFF, 0, 0, set()])
+                    o[0] += int(w[2])
+                    o[1] = min(o[1], int(w[3], 16))
+                    o[2] = max(o[2], int(w[4], 16))
+                    o[3] = max(o[3], int(w[5], 16))
+                    o[4] |= set(w[6].split(',')) if len(w) > 6 else set()
+                elif w[0] == 'R':                   # run from the work RAM: PC COUNT COPY_PC ENCODINGS SOURCES
+                    o = ram_pcs.setdefault(w[1], [0, '000000', set(), set()])
+                    o[0] += int(w[2])
+                    if o[1] == '000000':
+                        o[1] = w[3]
+                    o[2] |= set(w[4].split(','))
+                    o[3] |= set(w[5].split(','))
+                elif w[0] == 'X':                   # an address register's RAM address out: PC AN TO COUNT
+                    k = tuple(w[1:4])
+                    exits[k] = exits.get(k, 0) + int(w[4])
         if os.path.exists(p + '.z80'):
             for ln in open(p + '.z80'):
                 a, b = ln.split()
@@ -111,13 +142,26 @@ def merge(runs_dir, names, out_cov):
         f.writelines(f'{a} {m:08X}\n' for a, m in sorted(sites.items()))
     with atomic(out_cov + '.taint') as f:
         f.write('# mdkit taint 1 (merged): O ADDR SIZE PC VALUE FLAGS USES USE_PC; U PC COUNT WRITTEN_AT; '
-                'A LOAD_PC REG USES USE_PC ORIGIN_ADDR ORIGIN_SIZE ORIGIN_PC\n')
+                'A LOAD_PC REG USES USE_PC ORIGIN_ADDR ORIGIN_SIZE ORIGIN_PC; H PC VIA ADDR SIZE COUNT; '
+                'S PC VIA MIN MAX COUNT WRITTEN_AT; K PC COUNT LO HI JUMP VALUES; '
+                'R PC COUNT COPY_PC ENCODINGS SOURCES; X PC AN TO COUNT\n')
         for (a, s, pc), (v, fl, u, upc) in sorted(origins.items()):
             f.write(f'O {a} {s} {pc} {v} {fl:X} {u} {upc}\n')
         for pc, (n, at) in sorted(unattr.items()):
             f.write(f'U {pc} {n} {at}\n')
         for (pc, reg), (n, upc, oa, osz, opc) in sorted(loads.items()):
             f.write(f'A {pc} {reg} {n} {upc} {oa} {osz} {opc}\n')
+        for k, n in sorted(header.items()):
+            f.write(f'H {" ".join(k)} {n}\n')
+        for (pc, via), (lo, hi, n, at) in sorted(sub.items()):
+            f.write(f'S {pc} {via} {lo} {hi} {n} {at}\n')
+        for pc, (n, lo, hi, jump, vals) in sorted(stack.items()):
+            vals = sorted(vals, key=lambda v: int(v, 16))[:16]
+            f.write(f'K {pc} {n} {lo:08X} {hi:08X} {jump:X} {",".join(vals)}\n')
+        for pc, (n, copy, enc, srcs) in sorted(ram_pcs.items()):
+            f.write(f'R {pc} {n} {copy} {",".join(sorted(enc))} {",".join(sorted(srcs))}\n')
+        for k, n in sorted(exits.items()):
+            f.write(f'X {" ".join(k)} {n}\n')
     with atomic(out_cov + '.z80') as f:
         f.writelines(f'{a} {b}\n' for a, b in sorted(z80.items()))
     return len(pcs), per_run
