@@ -301,8 +301,10 @@ int main(int argc, char** argv) {
     const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     if (lockstep) printf("lockstep: %d frames identical%s", frames, "\n");
     if (!tape_path.empty()) printf("tape: %d frames, %d timeouts%s", frames, tape.timeouts, "\n");
-    if (!interp) printf("native %llu, interpreted %llu instructions%s", (unsigned long long)m.n_native,
-                        (unsigned long long)m.n_interp, "\n");
+    if (!interp) printf("native %llu, interpreted %llu instructions, %llu steps in STOP%s", (unsigned long long)m.n_native,
+                        (unsigned long long)m.n_interp, (unsigned long long)m.n_stop, "\n");
+    else printf("interpreted %llu instructions, %llu steps in STOP%s", (unsigned long long)m.n_interp,
+                (unsigned long long)m.n_stop, "\n");
     printf("%d frames in %.2f s (%.0f fps)  hash %016llx\n", frames, secs, frames / secs, (unsigned long long)md_hash(m));
     if (survey) {               // one line of key=value: tools/survey.py reads it
         const Survey& v = m.sv;

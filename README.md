@@ -14,11 +14,14 @@ The sibling of [gbkit](https://github.com/vs-sr-dev/gbkit),
 the front end of a future Mega Drive to Atari Jaguar translator: the same
 68000, and little else in common.
 
-Status: all 1349 cartridges of the library (below) recompiled to C++,
-built, and identical to the interpreter in lockstep for 6000 frames (the
-whole machine compared at every frame); 97.5% of the instructions the
-library runs are native (median per cart 99.98%; what is left is code in
-RAM). The interpreter is held to MAME (a build with only the Mega Drive
+Status: all 1349 cartridges of the library (below) recompiled to C++
+from what four runs each reached (21.7 million instructions), built, and
+identical to the interpreter in lockstep for 6000 frames with a fifth
+hand (the whole machine compared at every frame); 99.1% of the
+instructions run there are native (median per cart 99.99%; the steps the
+68000 waits in STOP are not counted). What is left is code in RAM (80%)
+and code the four runs never reached -- the games of a compilation they
+did not start (Mega Games 1-3, Disney Collection). The interpreter is held to MAME (a build with only the Mega Drive
 drivers) frame by frame: with no input, 1260 of the 1349 pictures are
 identical to MAME's at frame 300, 1190 at frame 1500.
 
@@ -52,6 +55,7 @@ build/md.exe ROM.bin --frames 6000 --monkey 1 --cover trace.cov            # the
 python -m mdkit.recomp ROM.bin --cover trace.cov --out build/recomp/GAME --build
 build/recomp/GAME/md.exe ROM.bin --frames 6000 --monkey 2 --lockstep      # native and interpreter, every frame
 python -m mdkit.recomp.all "Mega Drive/core" --jobs 4                     # every cart: trace, recompile, build, lockstep
+python -m mdkit.recomp.all "Mega Drive/core" --merged --seed 4            # the same from tools/cover.py's runs (below)
 python tools/disasm_oracle.py ROM.bin PATH/s1disasm --cover trace.cov    # discovery against a disassembly's data
 python tools/mamecmp.py "Mega Drive/core" --frames 300,1500,3000         # the interpreter against MAME, same pad
 python tools/survey.py "Mega Drive/core" --exe build/md.exe              # the library: VDP, raster, sound, code columns
@@ -161,6 +165,10 @@ as one, 96% of them from a known origin. 347 carts run code from the work
 RAM (54,620 instructions) -- among them those that reach it with a
 sign-extended address (`jsr $c500.w` runs `$FFFFC500`), which the tracer
 counted only after a 24-bit fix found by the Jaguar side's batch.
+Recompiled from the four runs, the library is 21.7 million instructions
+(17.6 million from the hand alone, median a cart 12,790 against 10,271),
+and all 1349 carts are identical to the interpreter in lockstep with a
+fifth hand (seed 4) for 6000 frames.
 
 ## The library
 

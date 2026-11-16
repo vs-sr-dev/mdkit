@@ -217,11 +217,12 @@ void MD::run_frame() {
         if (cover) (*cover)[(cpu.pc & 0xFFFFFF) >> 1] = 1;     // 24 bits: jsr $c500.w runs $FFFFC500, that is $FFC500
         if (steplog) steplog->push_back({cpu.pc, t});
         TAINT(taint_begin(cpu);)
+        const bool stop = cpu.stopped;
         const int c = m68k_step(cpu);
         TAINT(taint_end(cpu);)
         t += uint64_t(c) * CPU_T;
         cpu.cyc = 0;
-        n_interp++;
+        if (stop) n_stop++; else n_interp++;
     }
 }
 
@@ -263,10 +264,11 @@ void MD::run_frame_native() {
             }
         }
         if (steplog) steplog->push_back({cpu.pc | 0x80000000u, t});
+        const bool stop = cpu.stopped;
         const int c = m68k_step(cpu);
         t += uint64_t(c) * CPU_T;
         cpu.cyc = 0;
-        n_interp++;
+        if (stop) n_stop++; else n_interp++;
     }
 }
 

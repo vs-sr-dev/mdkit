@@ -8,6 +8,11 @@ build/recomp/all.csv: the instructions recompiled, the build's time, the lockste
 verdict and the share of instructions run natively.
 
     python -m mdkit.recomp.all "Mega Drive/core" [--only KEY,...|@FILE] [--jobs 4] [--frames 6000]
+                               [--merged] [--seed 2]
+
+--merged starts from the coverage tools/cover.py left in each cart's directory (every run's
+trace.cov, merged) instead of tracing seed 1 again, and leaves its export.json as it is;
+--seed is the hand of the lockstep.
 
 A cart whose slot banks the ROM is recompiled where it is fixed: SSF2's first 512 KB, none of Realtec's.
 """
@@ -37,13 +42,18 @@ def one(c, a):
     row = dict(key=c.key, title=c.title, slot=c.slot)
     flags = run_flags(c)
     cov = os.path.join(d, 'trace.cov')
-    t0 = time.time()
-    r = subprocess.run([a.exe, os.path.abspath(c.path), '--frames', str(a.frames), '--monkey', '1', '--cover', cov] + flags,
-                       capture_output=True, text=True, timeout=1800)
-    row['trace_s'] = round(time.time() - t0, 1)
-    if r.returncode or not os.path.exists(cov):
-        row['verdict'] = 'trace failed'
-        return row
+    if a.merged:
+        if not os.path.exists(cov):
+            row['verdict'] = 'no coverage'
+            return row
+    else:
+        t0 = time.time()
+        r = subprocess.run([a.exe, os.path.abspath(c.path), '--frames', str(a.frames), '--monkey', '1', '--cover', cov] + flags,
+                           capture_output=True, text=True, timeout=1800)
+        row['trace_s'] = round(time.time() - t0, 1)
+        if r.returncode or not os.path.exists(cov):
+            row['verdict'] = 'trace failed'
+            return row
     data = open(c.path, 'rb').read()
     # banked ROM: SSF2's fixed first 512 KB only; Realtec's (the whole ROM through its mapper) none
     limit = 0x80000 if c.slot == 'rom_ssf2' else 0 if c.slot == 'rom_realtec' else disc.ROM_END
@@ -54,13 +64,14 @@ def one(c, a):
     finally:
         disc.ROM_END = old
     row['insns'] = len(prog.code)
-    try:                        # the Jaguar side's input, beside the C++
-        import json
-        from mdkit.recomp.export import export as export_json
-        with open(os.path.join(d, 'export.json'), 'w', encoding='utf8') as f:
-            json.dump(export_json(c.path, [cov]), f)
-    except Exception as e:      # the export must not cost the lockstep
-        row['error'] = f'export: {e}'
+    if not a.merged:            # with --merged, tools/cover.py's export.json stays
+        try:                    # the Jaguar side's input, beside the C++
+            import json
+            from mdkit.recomp.export import export as export_json
+            with open(os.path.join(d, 'export.json'), 'w', encoding='utf8') as f:
+                json.dump(export_json(c.path, [cov]), f)
+        except Exception as e:  # the export must not cost the lockstep
+            row['error'] = f'export: {e}'
     for p in glob.glob(os.path.join(d, 'r*.cpp')) + glob.glob(os.path.join(d, '*.o')):
         os.remove(p)
     paths = emit(prog, d, zlib.crc32(data))
@@ -73,7 +84,7 @@ def one(c, a):
         return row
     row['build_s'] = round(time.time() - t0, 1)
     t0 = time.time()
-    r = subprocess.run([exe, os.path.abspath(c.path), '--frames', str(a.frames), '--monkey', '2', '--lockstep'] + flags,
+    r = subprocess.run([exe, os.path.abspath(c.path), '--frames', str(a.frames), '--monkey', str(a.seed), '--lockstep'] + flags,
                        capture_output=True, text=True, timeout=3600)
     row['lockstep_s'] = round(time.time() - t0, 1)
     out = r.stdout
@@ -100,6 +111,8 @@ def main(argv=None):
     ap.add_argument('--frames', type=int, default=6000)
     ap.add_argument('--out', default=os.path.join(HERE, 'build', 'recomp'))
     ap.add_argument('--exe', default=os.path.join(HERE, 'build', 'md.exe'))
+    ap.add_argument('--merged', action='store_true', help="tools/cover.py's merged trace.cov; export.json kept")
+    ap.add_argument('--seed', type=int, default=2, help="the lockstep's hand")
     ap.add_argument('--opt', default='-O0', help="g++'s optimisation for the generated code (the build's time rules)")
     a = ap.parse_args(argv)
     a.exe = os.path.abspath(a.exe)

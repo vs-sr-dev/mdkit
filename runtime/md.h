@@ -179,6 +179,7 @@ struct MD {
     // ... the recompiled code where there is some (md_native.h), the interpreter elsewhere
     void run_frame_native();
     uint64_t n_native = 0, n_interp = 0;        // instructions run each way
+    uint64_t n_stop = 0;                        // the interpreter's steps in STOP, waiting for an interrupt: neither
     std::vector<uint8_t>* cover = nullptr;
     std::map<uint32_t, uint32_t>* sites = nullptr;  // the tracer's: instruction -> the I/O classes it reached
     std::vector<uint16_t>* zcover = nullptr;    // the tracer's: each Z80 RAM byte run as code, $100 | its value then
