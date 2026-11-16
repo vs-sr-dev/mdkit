@@ -181,6 +181,7 @@ struct MD {
     uint64_t n_native = 0, n_interp = 0;        // instructions run each way
     std::vector<uint8_t>* cover = nullptr;
     std::map<uint32_t, uint32_t>* sites = nullptr;  // the tracer's: instruction -> the I/O classes it reached
+    std::vector<uint16_t>* zcover = nullptr;    // the tracer's: each Z80 RAM byte run as code, $100 | its value then
     std::vector<std::pair<uint32_t, uint64_t>>* steplog = nullptr;  // --steplog: (pc, t) of each instruction      // the tracer's: the instruction starts run, by pc / 2
     // the events due at t: lines, interrupts; sets next
     void events();

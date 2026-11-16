@@ -82,6 +82,7 @@ static uint32_t index_ext(M68K& c, uint32_t base, uint16_t ext) {
     const int n = (ext >> 12) & 7;
     uint32_t x = (ext & 0x8000) ? c.a[n] : c.d[n];
     if (!(ext & 0x800)) x = uint32_t(int32_t(int16_t(x)));
+    TAINT(if ((base & 0xFFFFFF) < 0xE00000) taint_base(c, (ext >> 12) & 15, x);)   // else a (negative) offset
     c.cyc += 2;
     return base + uint32_t(int32_t(int8_t(ext))) + x;
 }
@@ -93,18 +94,20 @@ static void ea_calc(M68K& c, EA& e, int mode, int reg, int size, bool pd = true)
     switch (mode) {
     case 0: e.kind = EA_D; break;
     case 1: e.kind = EA_A; break;
-    case 2: e.addr = c.a[reg]; break;
+    case 2: e.addr = c.a[reg]; TAINT(taint_base(c, 8 + reg, e.addr);) break;
     case 3:
         e.addr = c.a[reg];
+        TAINT(taint_base(c, 8 + reg, e.addr);)
         c.a[reg] += (reg == 7 && size == 1) ? 2 : uint32_t(size);
         break;
     case 4:
         if (pd) c.cyc += 2;
         c.a[reg] -= (reg == 7 && size == 1) ? 2 : uint32_t(size);
         e.addr = c.a[reg];
+        TAINT(taint_base(c, 8 + reg, e.addr);)
         break;
-    case 5: { const uint32_t b = c.a[reg]; e.addr = b + uint32_t(int32_t(int16_t(fetch(c)))); break; }
-    case 6: { const uint32_t b = c.a[reg]; e.addr = index_ext(c, b, fetch(c)); break; }
+    case 5: { const uint32_t b = c.a[reg]; TAINT(taint_base(c, 8 + reg, b);) e.addr = b + uint32_t(int32_t(int16_t(fetch(c)))); break; }
+    case 6: { const uint32_t b = c.a[reg]; TAINT(taint_base(c, 8 + reg, b);) e.addr = index_ext(c, b, fetch(c)); break; }
     default:
         switch (reg) {
         case 0: e.addr = uint32_t(int32_t(int16_t(fetch(c)))); break;
@@ -203,6 +206,7 @@ static void op_bit(M68K& c) {
 
 static void op_movep(M68K& c) {
     const int dn = reg9(c), opm = (c.ir >> 6) & 3;
+    TAINT(taint_base(c, 8 + ea_reg(c), c.a[ea_reg(c)]);)
     const uint32_t addr = c.a[ea_reg(c)] + uint32_t(int32_t(int16_t(fetch(c))));
     const int n = (opm & 1) ? 4 : 2;
     if (opm & 2) {
@@ -362,7 +366,7 @@ static void op_movem(M68K& c) {
     if (c.ir & 0x400) {
         // memory to registers; words are sign-extended into whole registers
         uint32_t addr;
-        if (mode == 3) addr = c.a[reg];
+        if (mode == 3) { addr = c.a[reg]; TAINT(taint_base(c, 8 + reg, addr);) }
         else { EA e; ea_calc(c, e, mode, reg, size); addr = e.addr; }
         for (int i = 0; i < 16; i++)
             if (list & (1 << i)) {
@@ -376,6 +380,7 @@ static void op_movem(M68K& c) {
     } else if (mode == 4) {
         // to -(An): the list is reversed, A7 first; An itself is stored as it was
         uint32_t addr = c.a[reg];
+        TAINT(taint_base(c, 8 + reg, addr);)
         for (int i = 0; i < 16; i++)
             if (list & (1 << i)) {
                 addr -= uint32_t(size);

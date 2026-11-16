@@ -41,6 +41,7 @@ build/m68ktest.exe PATH/SingleStepTests/m68000/v1             # the 68000 agains
 build/md.exe ROM.bin --machine NTSC-U --frames 600 --snap 300 --out DIR --monkey 1
 build/md.exe ROM.bin --frames 1800 --wav out.wav --vgm out.vgm   # the sound, and the log of every YM2612/PSG write
 build/md.exe ROM.bin --press "700+6:start;1000+60:right"       # a scripted pad instead of the monkey
+build/md.exe ROM.bin --tape session.tape                        # a scripted session: pad, RAM conditions, pokes
 build/md.exe ROM.bin --pcs F | --trace F | --iolog F | --ram F  # one frame's PCs, instructions, I/O, memory
 ```
 
@@ -92,6 +93,75 @@ rewrite. Sonic 1, for one, reaches the VDP mostly through an address
 register loaded once (`(An)`), and names the work RAM with `abs.w` 1055
 times.
 
+### Every run, and where the pointers come from
+
+A translation with no interpreter to fall back on has to know all the
+code that can run, and which values in the ROM are addresses of the work
+RAM. Three tools for that:
+
+```sh
+build/md_taint.exe ROM.bin --tape T.tape --cover run.cov      # the tracer, with run.cov.taint and run.cov.z80
+python tools/tapes_sonic1.py build/tapes/megadriv_sonic       # Sonic 1's sessions (37 tapes)
+python tools/cover.py ROM.bin --out build/recomp/megadriv_sonic --tapes build/tapes/megadriv_sonic --library
+python tools/cover.py "Mega Drive/core" --library --jobs 15   # every cart: the hand (3 seeds) and the attract mode
+python tools/z80_families.py --write-exports                  # the Z80 drivers, by their code alone
+```
+
+- `md.exe --tape`: a session a command a line -- `hold`, `tap`, `wait`,
+  `until` a RAM condition, `poke`/`keep`/`pokeat` the work RAM, `monkey`,
+  `snap`, `echo`. The engine is `runtime/md_tape.{h,cpp}` (the grammar is
+  in the header), a piece another harness can drive a machine with: each
+  write the tape makes to the work RAM also goes to its `on_write`, so a
+  second machine can be given the same (under `--lockstep`, the
+  interpreter's). `--inputlog FILE` writes what drove a run frame by
+  frame: the pad, and the tape's writes before that frame.
+- `build/md_taint.exe` (`build.sh` makes it: the runtime with
+  `-DMD_TAINT`, `runtime/md_taint.h`): every word and long the 68000
+  reads from the ROM -- data, or its own extension words (immediates,
+  absolute addresses, displacements, MOVEQ's byte) -- is an origin, and
+  a tag goes with its value through the registers and the work RAM. An
+  origin is marked when it lands in an address register, is the base or
+  index of an address in work RAM, or is compared (CMPA, CMP.L) with one.
+  The rule is on values (the input equal to what is written, or nearest
+  within 32 KB for a pointer plus an offset), not on each instruction's
+  dataflow; a work RAM address formed from a register no ROM word reached
+  is listed with the PC that last wrote that register. Each instruction
+  that loads an address register (from the ROM, an immediate, a data
+  register or the RAM; a copy between address registers keeps the load it
+  copies, an offset or an increment the register's own) is counted when
+  that register forms an address in work RAM: the sites a relocation has
+  to fix, with the origin of the value. The tracer also
+  writes the Z80's code: each byte of its RAM it ran, and its value.
+- `tools/cover.py`: runs the tracer several times (tapes, the hand with
+  seeds 1-3, the attract mode with no input) and keeps their union as
+  `trace.cov` (and `.sites`, `.taint`, `.z80`), the runs in `runs/` and
+  `runs.json`, and writes `export.json` from it with `ram_pointers`,
+  `immediates`, `an_loads`, `unattributed`, `z80_code` and `runs`. Runs
+  made before (a cart's tapes) stay in the union when the library's are
+  made again.
+
+Sonic 1 with its 37 tapes (level select and debug codes, every act with
+the debug cursor hopping it on, the six bosses, every special stage, the
+sound test, game over and continue, the endings and credits) and the
+library's runs: 21,373 instructions run (6,383 with the hand alone),
+23,007 discovered, 522 access sites (271), recompiled and identical to
+the interpreter in lockstep on the tapes; s1disasm still finds none of
+them in data. Fifteen longs `$00FFxxxx` of its data are proved addresses
+of the work RAM (the table at `$D652`, read at `$D68E`, formed 8 million
+accesses), and 52 words (`$8000`-`$FFFF`, sign-extended by `movea.w`);
+the `movea.w #$fff0,A3` reach an address register but never form an
+address (s1disasm: a tile's height, added to `D2`).
+
+The library with its four runs (the hand with seeds 1-3, the attract
+mode): 14.2 million instructions run, 60% more than with the hand alone
+(median a cart 8,982, against 5,639); the attract mode alone adds code in
+835 carts. 1294 carts have proved work RAM pointers in their data (44,620
+longs, 54,221 words); 422,133 sites load an address register later used
+as one, 96% of them from a known origin. 347 carts run code from the work
+RAM (54,620 instructions) -- among them those that reach it with a
+sign-extended address (`jsr $c500.w` runs `$FFFFC500`), which the tracer
+counted only after a 24-bit fix found by the Jaguar side's batch.
+
 ## The library
 
 `cart.py` recognises a dump by CRC32 against MAME's software list
@@ -136,6 +206,10 @@ counts what it does with the machine (modes held over 60 frames):
   channel 3's special mode 220, CSM 4; the PSG 1338. The Z80's RAM when the
   68000 lets it run: 818 distinct images, the largest group 137 carts
   (Aladdin, Aero the Acro-Bat, Real Monsters...: GEMS by the look of it).
+  By the Z80's code alone (`tools/z80_families.py`: the bytes it ran,
+  8-byte sequences, no addresses): 1079 builds in 390 families, 724 carts
+  in families of five or more; the largest, 212 carts (Aladdin, Cool Spot,
+  Dragon...), GEMS again; Sonic 1's Z80 runs 193 bytes, a DAC loop.
 - Code: the work RAM named by `abs.l` above all (median 1403 operands a
   cart), `abs.w` in 777 carts (Sonic 1: 1055); the hardware reached
   through an address register (`(An)`, `(An)+`, `d16(An)`: 274,000 operands

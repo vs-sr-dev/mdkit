@@ -214,9 +214,11 @@ void MD::run_frame() {
     frame_done = false;
     while (!frame_done) {
         if (t >= next) { events(); continue; }
-        if (cover && cpu.pc < 0x1000000) (*cover)[cpu.pc >> 1] = 1;
+        if (cover) (*cover)[(cpu.pc & 0xFFFFFF) >> 1] = 1;     // 24 bits: jsr $c500.w runs $FFFFC500, that is $FFC500
         if (steplog) steplog->push_back({cpu.pc, t});
+        TAINT(taint_begin(cpu);)
         const int c = m68k_step(cpu);
+        TAINT(taint_end(cpu);)
         t += uint64_t(c) * CPU_T;
         cpu.cyc = 0;
         n_interp++;
@@ -274,7 +276,18 @@ void MD::z80_sync() {
     const uint64_t target = now();
     if (z80_reset || z80_busreq) { if (zt < target) zt = target; return; }
     z80_running = true;
-    while (zt < target) zt += uint64_t(z80.step()) * Z80_T;
+    if (!zcover) while (zt < target) zt += uint64_t(z80.step()) * Z80_T;
+    else while (zt < target) {
+        // the code the Z80 runs from its RAM: an instruction's bytes when it falls through, its first byte when it jumps
+        const u16 pc = z80.PC;
+        zt += uint64_t(z80.step()) * Z80_T;
+        if (pc >= 0x4000) continue;
+        const int n = (z80.PC - pc) & 0xFFFF;
+        for (int k = 0; k < (n >= 1 && n <= 4 ? n : 1); k++) {
+            const u16 a = (pc + k) & 0x1FFF;
+            if (!(*zcover)[a]) (*zcover)[a] = uint16_t(0x100 | zram[a]);
+        }
+    }
     z80_running = false;
 }
 

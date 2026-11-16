@@ -3,14 +3,18 @@
 //   md ROM.bin [--machine NTSC-U|NTSC-J|PAL] [--sram BYTES] [--pad6] [--frames N]
 //              [--snap F1,F2,...] [--out DIR] [--monkey SEED] [--state] [--slot MAME_SLOT]
 //              [--interp] [--lockstep] [--cover FILE]
-//              [--wav FILE] [--vgm FILE] [--press "FRAME+LEN:button;..."]
+//              [--wav FILE] [--vgm FILE] [--press "FRAME+LEN:button;..."] [--tape FILE] [--inputlog FILE]
 //              [--pcs F] [--trace F] [--iolog F] [--ram F]     (diagnostics of frame F)
 //
 // The ROM is the list's image (cart.py --collect writes it so).  --monkey drives pad 1
 // with a scripted, seeded hand: Start now and then, the buttons and the directions at random.
+// --tape plays a scripted session (md_tape.h) and the run ends with it; --inputlog FILE writes
+// the pad and the tape's RAM writes frame by frame.  Built with -DMD_TAINT
+// (build/md_taint.exe), --cover FILE also writes FILE.taint (md_taint.h).
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cctype>
 #include <string>
 #include <set>
 #include <vector>
@@ -19,6 +23,7 @@
 #include <algorithm>
 #include "md.h"
 #include "md_native.h"
+#include "md_tape.h"
 
 static std::vector<uint8_t> load(const char* path) {
     std::vector<uint8_t> d;
@@ -32,35 +37,7 @@ static std::vector<uint8_t> load(const char* path) {
     return d;
 }
 
-static void write_ppm(const std::string& path, const MD& m) {
-    FILE* f = fopen(path.c_str(), "wb");
-    if (!f) return;
-    fprintf(f, "P6\n%d %d\n255\n", m.vdp.out_w, m.vdp.out_h);
-    std::vector<uint8_t> row(size_t(m.vdp.out_w) * 3);
-    for (int y = 0; y < m.vdp.out_h; y++) {
-        for (int x = 0; x < m.vdp.out_w; x++) {
-            const uint32_t c = m.vdp.out[y * MAX_W + x];
-            row[x * 3] = uint8_t(c >> 16); row[x * 3 + 1] = uint8_t(c >> 8); row[x * 3 + 2] = uint8_t(c);
-        }
-        fwrite(row.data(), 1, row.size(), f);
-    }
-    fclose(f);
-}
 
-// the monkey: a new hand every 6 frames from a xorshift seeded by SEED
-static uint16_t monkey(uint64_t frame, uint32_t seed) {
-    uint32_t x = seed * 2654435761u ^ uint32_t(frame / 6) * 40503u ^ 0x9E3779B9u;
-    for (int i = 0; i < 4; i++) { x ^= x << 13; x ^= x >> 17; x ^= x << 5; }
-    uint16_t b = 0;
-    const uint64_t f = frame % 600;
-    if ((frame > 90 && f < 4) || (frame < 400 && frame % 120 < 3)) b |= 0x80;   // Start
-    if (x & 1) b |= 0x10;                       // A
-    if (x & 2) b |= 0x20;                       // B
-    if ((x & 12) == 12) b |= 0x40;              // C
-    static const uint16_t dirs[8] = {0, 1, 2, 4, 8, 8, 5, 9};
-    b |= dirs[(x >> 4) & 7];
-    return b;
-}
 
 static uint64_t fnv(const void* p, size_t n, uint64_t h) {
     const uint8_t* b = static_cast<const uint8_t*>(p);
@@ -114,6 +91,7 @@ static std::vector<Press> parse_presses(const std::string& v) {
     return out;
 }
 
+
 int main(int argc, char** argv) {
     if (argc < 2) {
         fprintf(stderr, "md ROM [--machine NTSC-U|NTSC-J|PAL] [--sram N] [--pad6] [--frames N] [--snap F,...] "
@@ -128,7 +106,7 @@ int main(int argc, char** argv) {
     std::vector<Press> presses;
     bool interp = false, lockstep = false, steplog = false, survey = false;
     std::vector<std::pair<uint32_t, uint64_t>> log_m, log_ref;
-    std::string cover_path;
+    std::string cover_path, tape_path, inputlog_path;
     int pcs_frame = -1, iolog_frame = -1, pcs_n = 24, trace_frame = -1, trace_n = 100000, traced = 0, ram_frame = -1;
     std::set<int> snaps;
     std::string out = ".", slot = "rom", wav, vgm;
@@ -153,6 +131,8 @@ int main(int argc, char** argv) {
         else if (a == "--cover") cover_path = val();
         else if (a == "--vgm") vgm = val();
         else if (a == "--press") presses = parse_presses(val());
+        else if (a == "--tape") tape_path = val();
+        else if (a == "--inputlog") inputlog_path = val();
         else if (a == "--ram") ram_frame = std::stoi(val());
         else if (a == "--trace") trace_frame = std::stoi(val());
         else if (a == "--trace-n") trace_n = std::stoi(val());
@@ -171,20 +151,55 @@ int main(int argc, char** argv) {
     if (lockstep && steplog) { m.steplog = &log_m; ref.steplog = &log_ref; }
     std::vector<uint8_t> cov;
     std::map<uint32_t, uint32_t> site_map;
-    if (!cover_path.empty()) { cov.assign(1 << 23, 0); m.cover = &cov; m.sites = &site_map; interp = true; }
+    std::vector<uint16_t> zcov;
+    if (!cover_path.empty()) { cov.assign(1 << 23, 0); m.cover = &cov; m.sites = &site_map; interp = true; zcov.assign(0x2000, 0); m.zcover = &zcov; }
     if (md_native_n == 0) interp = true;
+#ifdef MD_TAINT
+    if (!cover_path.empty()) taint_attach(&m.cpu, uint32_t(image.size()));
+#endif
+    Tape tape;
+    tape.out = out;
+    std::vector<std::string> written;       // this frame's tape writes, for --inputlog
+    tape.on_write = [&](uint32_t a, int size, uint32_t v) {
+        if (lockstep) {     // the lockstep's interpreter sees the same session
+            uint32_t x = v;
+            for (int k = size - 1; k >= 0; k--) { ref.ram[(a + k) & 0xFFFF] = uint8_t(x); x >>= 8; }
+        }
+        char buf[64];
+        snprintf(buf, sizeof buf, "poke %06X %c %X", a, size == 1 ? 'b' : size == 2 ? 'w' : 'l', v);
+        written.push_back(buf);
+    };
+    if (!tape_path.empty()) {
+        if (!tape.load(tape_path)) { fprintf(stderr, "cannot read %s\n", tape_path.c_str()); return 1; }
+        frames = 1 << 30;
+    }
     m.sound.open(wav, vgm, m.pal ? 53203424.0 : 53693175.0);
     if (iolog_frame >= 0) {
         m.cpu.io_r8 = log_r8; m.cpu.io_r16 = log_r16; m.cpu.io_w8 = log_w8; m.cpu.io_w16 = log_w16;
     }
+    // --inputlog FILE: what drove the machine, frame by frame: "FRAME PAD" (pad 1, bits 0-11
+    // U D L R A B C Start X Y Z Mode), then "FRAME poke ADDR b|w|l VALUE" for each write the tape
+    // made to the work RAM before that frame
+    FILE* inlog = inputlog_path.empty() ? nullptr : fopen(inputlog_path.c_str(), "wb");
+    if (inlog) fprintf(inlog, "# mdkit input log: FRAME PAD, FRAME poke ADDR SIZE VALUE\n");
     const auto t0 = std::chrono::steady_clock::now();
     for (int f = 0; f < frames; f++) {
-        if (use_monkey) m.pad[0].buttons = monkey(uint64_t(f), seed);
+        if (!tape_path.empty()) {
+            uint16_t b = 0;
+            if (!tape.frame(m, f, b)) { frames = f; break; }
+            m.pad[0].buttons = b;
+        }
+        if (use_monkey) m.pad[0].buttons = md_monkey(uint64_t(f), seed);
         if (!presses.empty()) {
             uint16_t b = 0;
             for (const Press& p : presses) if (f >= p.from && f < p.to) b |= p.mask;
             m.pad[0].buttons = b;
         }
+        if (inlog) {
+            fprintf(inlog, "%d %03X\n", f, m.pad[0].buttons);
+            for (const std::string& w : written) fprintf(inlog, "%d %s\n", f, w.c_str());
+        }
+        written.clear();
         if (f == iolog_frame) { g_iolog = true; printf("-- frame %d I/O\n", f); }
         if (f == pcs_frame || f == trace_frame) {
             // the frame's instructions, counted by address
@@ -256,9 +271,10 @@ int main(int argc, char** argv) {
         if (snaps.count(f)) {
             char name[64];
             snprintf(name, sizeof name, "/f%05d.ppm", f);
-            write_ppm(out + name, m);
+            md_write_ppm(out + name, m);
         }
     }
+    if (inlog) fclose(inlog);
     m.sound.close(m.t);
     if (!cover_path.empty()) {
         FILE* o = fopen(cover_path.c_str(), "wb");
@@ -272,9 +288,19 @@ int main(int argc, char** argv) {
             for (auto& [pc, mask] : site_map) fprintf(o, "%06X %08X%s", pc, mask, "\n");
             fclose(o);
         }
+        // the Z80's code, beside it: "ADDR BYTE", each Z80 RAM byte run as code and its value then
+        o = fopen((cover_path + ".z80").c_str(), "wb");
+        if (o) {
+            for (uint32_t i = 0; i < zcov.size(); i++) if (zcov[i]) fprintf(o, "%04X %02X%s", i, zcov[i] & 0xFF, "\n");
+            fclose(o);
+        }
+#ifdef MD_TAINT
+        taint_save((cover_path + ".taint").c_str());
+#endif
     }
     const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     if (lockstep) printf("lockstep: %d frames identical%s", frames, "\n");
+    if (!tape_path.empty()) printf("tape: %d frames, %d timeouts%s", frames, tape.timeouts, "\n");
     if (!interp) printf("native %llu, interpreted %llu instructions%s", (unsigned long long)m.n_native,
                         (unsigned long long)m.n_interp, "\n");
     printf("%d frames in %.2f s (%.0f fps)  hash %016llx\n", frames, secs, frames / secs, (unsigned long long)md_hash(m));

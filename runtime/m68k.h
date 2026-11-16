@@ -16,6 +16,7 @@
 #pragma once
 #include <cstdint>
 #include <cstring>
+#include "md_taint.h"
 
 enum : uint16_t { SR_C = 1, SR_V = 2, SR_Z = 4, SR_N = 8, SR_X = 16, SR_S = 0x2000, SR_T = 0x8000 };
 enum { V_BUS = 2, V_ADDRESS, V_ILLEGAL, V_ZERO_DIVIDE, V_CHK, V_TRAPV, V_PRIVILEGE, V_TRACE, V_LINE_A,
@@ -100,6 +101,7 @@ inline int prog_fc(const M68K& c) { return supervisor(c) ? 6 : 2; }
 inline uint16_t fetch(M68K& c) {
     if (c.pc & 1) address_error(c, c.pc, true, true, prog_fc(c));
     const uint16_t v = bus_r16(c, c.pc);
+    TAINT(taint_fetch(c, c.pc, v);)
     c.pc += 2;
     c.cyc += 4;
     return v;
@@ -110,30 +112,37 @@ inline uint32_t rd8(M68K& c, uint32_t a) { c.cyc += 4; return bus_r8(c, a); }
 inline uint32_t rd16(M68K& c, uint32_t a) {
     if (a & 1) address_error(c, a, true, false, data_fc(c));
     c.cyc += 4;
-    return bus_r16(c, a);
+    const uint32_t v = bus_r16(c, a);
+    TAINT(taint_read(c, a, 2, v);)
+    return v;
 }
 inline uint32_t rd32(M68K& c, uint32_t a) {
     if (a & 1) address_error(c, a, true, false, data_fc(c));
     c.cyc += 8;
     const uint32_t hi = bus_r16(c, a);
-    return hi << 16 | bus_r16(c, a + 2);
+    const uint32_t v = hi << 16 | bus_r16(c, a + 2);
+    TAINT(taint_read(c, a, 4, v);)
+    return v;
 }
 inline void wr8(M68K& c, uint32_t a, uint32_t v) { c.cyc += 4; bus_w8(c, a, uint8_t(v)); }
 inline void wr16(M68K& c, uint32_t a, uint32_t v) {
     if (a & 1) address_error(c, a, false, false, data_fc(c));
     c.cyc += 4;
+    TAINT(taint_write(c, a, 2, v);)
     bus_w16(c, a, uint16_t(v));
 }
 // a long write: the high word first (MAME's microcode), except to -(An), which writes the low word first
 inline void wr32(M68K& c, uint32_t a, uint32_t v) {
     if (a & 1) address_error(c, a, false, false, data_fc(c));
     c.cyc += 8;
+    TAINT(taint_write(c, a, 4, v);)
     bus_w16(c, a, uint16_t(v >> 16));
     bus_w16(c, a + 2, uint16_t(v));
 }
 inline void wr32_pd(M68K& c, uint32_t a, uint32_t v) {
     if (a & 1) address_error(c, a, false, false, data_fc(c));
     c.cyc += 8;
+    TAINT(taint_write(c, a, 4, v);)
     bus_w16(c, a + 2, uint16_t(v));
     bus_w16(c, a, uint16_t(v >> 16));
 }

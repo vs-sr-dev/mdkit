@@ -359,14 +359,17 @@ def _ea(rd, mode, reg, size, imm_signed=False):
         else:
             e.text = f'({_sh(w, 8)},{base},{idx})' if w & 0xFF else f'({base},{idx})'
     elif k == 'aw':
+        e.ext_at = rd.pc
         w = rd.word()
         e.addr = _sx(w, 16) & 0xFFFFFF
         e.text = f'${w:x}.w'
     elif k == 'al':
+        e.ext_at = rd.pc
         v = rd.long()
         e.addr = v & 0xFFFFFF
         e.text = f'${v:x}.l'
     elif k == 'imm':
+        e.ext_at = rd.pc
         if size == 'l':
             v = rd.long()
         else:

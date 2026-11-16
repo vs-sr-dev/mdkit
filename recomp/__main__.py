@@ -18,7 +18,7 @@ from .emit import emit
 
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 GXX = os.environ.get('MDKIT_GXX', r'C:\msys64\ucrt64\bin\g++.exe')
-RUNTIME_OBJS = ['md_core', 'md_vdp', 'md_cart', 'md_sound', 'm68k', 'z80', 'md_main',
+RUNTIME_OBJS = ['md_core', 'md_vdp', 'md_cart', 'md_sound', 'm68k', 'z80', 'md_main', 'md_tape',
                 'ymfm_opn', 'ymfm_adpcm', 'ymfm_ssg']
 
 
