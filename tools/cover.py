@@ -68,6 +68,7 @@ def merge(runs_dir, names, out_cov):
     """The union of the runs' files as out_cov, .sites and .taint; each run's own count."""
     pcs, sites, origins, unattr, z80, loads = set(), {}, {}, {}, {}, {}
     header, sub, stack, ram_pcs, exits = {}, {}, {}, {}, {}
+    writes, writers, returns = {}, {}, {}
     per_run = {}
     for n in names:
         p = os.path.join(runs_dir, n + '.cov')
@@ -132,6 +133,18 @@ def merge(runs_dir, names, out_cov):
                 elif w[0] == 'X':                   # an address register's RAM address out: PC AN TO COUNT
                     k = tuple(w[1:4])
                     exits[k] = exits.get(k, 0) + int(w[4])
+                elif w[0] == 'W':                   # an An written: PC AN KIND FROM WRITES USES USE_PC
+                    o = writes.setdefault((w[1], w[2]), [w[3], w[4], 0, 0, '000000'])
+                    o[2] += int(w[5])
+                    o[3] += int(w[6])
+                    if o[4] == '000000' and int(w[6]):
+                        o[4] = w[7]
+                elif w[0] == 'Y':                   # an exit's writers: EXIT_PC AN TO WRITE_PC WRITE_AN COUNT
+                    k = tuple(w[1:6])
+                    writers[k] = writers.get(k, 0) + int(w[6])
+                elif w[0] == 'E':                   # an exit's returns: EXIT_PC AN TO RETURN_PC HOW REG COUNT
+                    k = tuple(w[1:7])
+                    returns[k] = returns.get(k, 0) + int(w[7])
         if os.path.exists(p + '.z80'):
             for ln in open(p + '.z80'):
                 a, b = ln.split()
@@ -144,7 +157,8 @@ def merge(runs_dir, names, out_cov):
         f.write('# mdkit taint 1 (merged): O ADDR SIZE PC VALUE FLAGS USES USE_PC; U PC COUNT WRITTEN_AT; '
                 'A LOAD_PC REG USES USE_PC ORIGIN_ADDR ORIGIN_SIZE ORIGIN_PC; H PC VIA ADDR SIZE COUNT; '
                 'S PC VIA MIN MAX COUNT WRITTEN_AT; K PC COUNT LO HI JUMP VALUES; '
-                'R PC COUNT COPY_PC ENCODINGS SOURCES; X PC AN TO COUNT\n')
+                'R PC COUNT COPY_PC ENCODINGS SOURCES; X PC AN TO COUNT; W PC AN KIND FROM WRITES USES USE_PC; '
+                'Y EXIT_PC AN TO WRITE_PC WRITE_AN COUNT; E EXIT_PC AN TO RETURN_PC HOW REG COUNT\n')
         for (a, s, pc), (v, fl, u, upc) in sorted(origins.items()):
             f.write(f'O {a} {s} {pc} {v} {fl:X} {u} {upc}\n')
         for pc, (n, at) in sorted(unattr.items()):
@@ -162,6 +176,12 @@ def merge(runs_dir, names, out_cov):
             f.write(f'R {pc} {n} {copy} {",".join(sorted(enc))} {",".join(sorted(srcs))}\n')
         for k, n in sorted(exits.items()):
             f.write(f'X {" ".join(k)} {n}\n')
+        for (pc, an), (kind, frm, n, u, upc) in sorted(writes.items()):
+            f.write(f'W {pc} {an} {kind} {frm} {n} {u} {upc}\n')
+        for k, n in sorted(writers.items()):
+            f.write(f'Y {" ".join(k)} {n}\n')
+        for k, n in sorted(returns.items()):
+            f.write(f'E {" ".join(k)} {n}\n')
     with atomic(out_cov + '.z80') as f:
         f.writelines(f'{a} {b}\n' for a, b in sorted(z80.items()))
     return len(pcs), per_run

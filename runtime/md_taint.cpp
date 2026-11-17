@@ -67,6 +67,21 @@ struct State {
     // an address register's work RAM address leaving the address registers: (PC, An, 'd' a data register,
     // 'm' memory, 'c' compared) -> times
     std::map<std::tuple<uint32_t, int, char>, uint64_t> exits;
+    // an_writes: each instruction that writes A0-A6, known by its encoding (a write of the same value is a
+    // write), keyed (PC, register); the sites each register's value is credited to (the last writer, and
+    // the sites of the register a copy or an ADDA reads); every work RAM address the register forms is a use
+    // of each of them
+    struct WSite { uint64_t writes = 0, uses = 0; uint32_t use_pc = 0; char kind = 0; int from = -1; };
+    std::map<std::pair<uint32_t, int>, WSite> wsites;
+    std::vector<std::pair<const std::pair<uint32_t, int>, WSite>*> cred[7];
+    // the exits' carriers: an An's work RAM address once it left (to a Dn, to a long of the RAM), followed
+    // while it is moved whole (Dn, a long in the RAM), until it comes back into an An or is an index
+    std::vector<std::tuple<uint32_t, int, char>> exit_keys;           // carrier id - 1 -> its exit
+    std::map<std::tuple<uint32_t, int, char>, uint32_t> exit_ids;
+    uint32_t dcar[8] = {}, dval[8] = {};                             // each data register's carrier, its value
+    std::vector<uint32_t> mcar = std::vector<uint32_t>(0x8000, 0), mval = std::vector<uint32_t>(0x8000, 0);
+    std::map<std::tuple<uint32_t, uint32_t, char, int>, uint64_t> returns;   // (carrier, PC, 'a' An / 'i' index, reg)
+    std::map<std::pair<uint32_t, std::pair<uint32_t, int>>, uint64_t> exit_writers;   // (carrier, write site)
 };
 State g;
 
@@ -248,6 +263,53 @@ void probe(M68K& c, bool ran, uint16_t ir) {
     }
 }
 
+// the address registers A0-A6 an instruction writes, known by its encoding: the register, the kind, and the
+// register a copy reads (8+n An, n Dn, 15 A7; -1 none).  Kinds: m memory (MOVEA, MOVEM, UNLK), i an immediate
+// or an absolute address (MOVEA #, LEA abs), p PC-relative (LEA), c a copy (MOVEA An, LEA off another An),
+// x EXG, d a data register (MOVEA Dn), a ADDA/SUBA (a write only when the value is not the register's own
+// plus an offset), l LINK (from A7), u MOVE USP.  An offset or an increment of a register into itself
+// (LEA d(An),An, ADDQ, (An)+) is not a write.
+struct AW { int reg; char kind; int from; };
+int an_written(uint16_t ir, AW* out) {
+    const int r9 = (ir >> 9) & 7, mode = (ir >> 3) & 7, r0 = ir & 7;
+    int n = 0;
+    auto add = [&](int reg, char kind, int from) { if (reg < 7) out[n++] = {reg, kind, from}; };
+    if ((ir & 0xC1C0) == 0x0040 && (ir >> 12) >= 2) {                     // MOVEA.L, MOVEA.W
+        if (mode == 0) add(r9, 'd', r0);
+        else if (mode == 1) { if (r0 != r9) add(r9, 'c', 8 + r0); }
+        else if (mode == 7 && r0 == 4) add(r9, 'i', -1);
+        else add(r9, 'm', -1);
+    } else if ((ir & 0xF1C0) == 0x41C0) {                                // LEA
+        if (mode == 7) add(r9, r0 < 2 ? 'i' : 'p', -1);
+        else if (r0 != r9) add(r9, 'c', 8 + r0);
+    } else if ((ir & 0xF1F8) == 0xC148) {                                // EXG Ax,Ay
+        if (r9 != r0) { add(r9, 'x', 8 + r0); add(r0, 'x', 8 + r9); }
+    } else if ((ir & 0xF1F8) == 0xC188) {                                // EXG Dx,Ay
+        add(r0, 'x', r9);
+    } else if ((ir & 0xFF80) == 0x4C80) {                                // MOVEM to the registers
+        const uint16_t list = g.ext.empty() ? 0 : uint16_t(g.ext[0].value);
+        for (int i = 8; i < 15; i++)                                     // (An)+ in its list: An is the address
+            if (list >> i & 1 && !(mode == 3 && i - 8 == r0)) add(i - 8, 'm', -1);
+    } else if ((ir & 0xB0C0) == 0x90C0) {                                // ADDA, SUBA
+        add(r9, 'a', mode == 1 ? 8 + r0 : mode == 0 ? r0 : -1);
+    } else if ((ir & 0xFFF8) == 0x4E50) add(r0, 'l', 15);                // LINK
+    else if ((ir & 0xFFF8) == 0x4E58) add(r0, 'm', -1);                  // UNLK
+    else if ((ir & 0xFFF8) == 0x4E68) add(r0, 'u', -1);                  // MOVE USP,An
+    return n;
+}
+
+// an exit of An's work RAM address (to: 'd', 'm', 'c'): counted, with the sites An's value is credited to;
+// its carrier id
+uint32_t exit_at(uint32_t pc, int an, char to) {
+    const auto key = std::make_tuple(pc & 0xFFFFFF, an, to);
+    g.exits[key]++;
+    auto [it, fresh] = g.exit_ids.try_emplace(key, uint32_t(g.exit_keys.size() + 1));
+    if (fresh) g.exit_keys.push_back(key);
+    if (an < 7)
+        for (auto* s : g.cred[an]) g.exit_writers[{it->second, s->first}]++;
+    return it->second;
+}
+
 }  // namespace
 
 void taint_attach(M68K* c, uint32_t rom_size) {
@@ -278,6 +340,11 @@ void taint_base(M68K& c, int reg, uint32_t value) {
     g.named |= 1u << reg;
     const uint32_t tag = g.reg[reg];
     if (in_ram(value)) {
+        if (reg >= 8 && reg < 15)
+            for (auto* s : g.cred[reg - 8])
+                if (!s->second.uses++) s->second.use_pc = c.ipc & 0xFFFFFF;
+        if (reg < 8 && g.dcar[reg] && g.dval[reg] == c.d[reg])     // an exit's value back, as an index
+            g.returns[{g.dcar[reg], c.ipc & 0xFFFFFF, 'i', reg}]++;
         if (reg >= 8) {
             auto [it, fresh] = g.loads.try_emplace(g.loader[reg], State::Load{reg, 0, c.ipc & 0xFFFFFF, tag});
             it->second.uses++;
@@ -338,10 +405,25 @@ void taint_end(M68K& c) {
             for (const Cand& k : cands)
                 if (in_ram(word_a && k.size == 2 ? uint32_t(sext16(k.v)) : k.v)) mark(cand_tag(k), TAINT_RAM_CMP);
         for (const Cand& k : cands)
-            if (k.reg >= 8 && k.reg < 15 && in_ram(k.v)) g.exits[{c.ipc & 0xFFFFFF, k.reg - 8, 'c'}]++;
+            if (k.reg >= 8 && k.reg < 15 && in_ram(k.v)) exit_at(c.ipc, k.reg - 8, 'c');
+    }
+    // the exits' carriers the step reads: a long of the work RAM (as read), a data register it names
+    struct InCar { uint32_t v, id; int read; };
+    std::vector<InCar> incar;
+    if (ran) {
+        for (size_t j = 0; j < g.reads.size(); j++) {
+            const Access& r = g.reads[j];
+            if (r.size != 4 || !wram(r.addr)) continue;
+            const uint32_t w = (r.addr & 0xFFFF) >> 1, w1 = (w + 1) & 0x7FFF;
+            if (g.mcar[w] && g.mcar[w] == g.mcar[w1] && g.mval[w] == r.value) incar.push_back({r.value, g.mcar[w], int(j)});
+        }
+        for (int i = 0; i < 8; i++)
+            if (g.named >> i & 1 && g.dcar[i] && g.dval[i] == g.before[i]) incar.push_back({g.before[i], g.dcar[i], -1});
     }
     // the registers written
     uint32_t after[16];
+    bool fresh[16] = {};                         // written, and not made from itself
+    uint32_t dexit[8] = {};                      // a data register an An's address went to: its exit
     for (int i = 0; i < 8; i++) { after[i] = c.d[i]; after[8 + i] = c.a[i]; }
     for (int i = 0; i < 16; i++) {
         if (after[i] == g.before[i]) continue;
@@ -356,24 +438,100 @@ void taint_end(M68K& c) {
         if (i == 15 && g.reg[15] && int32_t(after[i] - g.before[i]) > -0x8000 && int32_t(after[i] - g.before[i]) < 0x8000)
         { t = g.reg[15]; same = true; }
         if (!ran) same = true;
+        fresh[i] = !same;
         if (i >= 8 && !same)
             g.loader[i] = win && win->reg >= 8 ? g.loader[win->reg] : c.ipc & 0xFFFFFF;
         g.reg[i] = t;
         if (!t) g.lost[i] = ran ? c.ipc & 0xFFFFFF : 0xFFFFFF;     // $FFFFFF: an exception's entry
         if (i >= 8 && t) mark(t, TAINT_TO_AN);
-        if (ran && i < 8 && win && win->reg >= 8 && win->v == after[i] && in_ram(after[i]))
-            g.exits[{c.ipc & 0xFFFFFF, win->reg - 8, 'd'}]++;
     }
-    // the work RAM written
-    for (const Access& w : g.writes) {
+    // an An's work RAM address put whole into a data register: MOVE.L An,Dn, EXG Dx,Ay (by the encoding: a
+    // result equal to a named An by chance, not.w d1 with A3 = $FFFFFFF0, is not one)
+    if (ran && ((ir & 0xF1F8) == 0x2008 || (ir & 0xF1F8) == 0xC188) && in_ram(g.before[8 + (ir & 7)]))
+        dexit[(ir >> 9) & 7] = exit_at(c.ipc, ir & 7, 'd');
+    // the work RAM written; the carriers in it: any write clears its words' carriers, a long sets them
+    for (const Access& w : g.pwrites)
+        if (wram(w.addr))
+            for (int i = 0; i < w.size; i++) g.mcar[((w.addr + uint32_t(i)) & 0xFFFF) >> 1] = 0;
+    // MOVEM to the memory: its j-th write is its list's j-th register (-(An): A7 first)
+    std::vector<int> mregs;
+    if (ran && (ir & 0xFF80) == 0x4880 && !g.ext.empty()) {
+        const uint16_t list = uint16_t(g.ext[0].value);
+        for (int i = 0; i < 16; i++)
+            if (list >> i & 1) mregs.push_back(((ir >> 3) & 7) == 4 ? 15 - i : i);
+    }
+    for (size_t j = 0; j < g.writes.size(); j++) {
+        const Access& w = g.writes[j];
         if (!in_ram(w.addr)) continue;
         const Cand* win = nullptr;
         const uint32_t t = best(cands, w.value, w.size, nullptr, nullptr, -1, &win);
-        if (ran && w.size == 4 && win && win->reg >= 8 && win->v == w.value && in_ram(w.value))
-            g.exits[{c.ipc & 0xFFFFFF, win->reg - 8, 'm'}]++;
+        uint32_t car = 0;
+        const int mr = j < mregs.size() ? mregs[j] : -1;
+        if (mr >= 0) {
+            if (w.size == 4 && mr >= 8 && g.before[mr] == w.value && in_ram(w.value)) car = exit_at(c.ipc, mr - 8, 'm');
+            else if (w.size == 4 && mr < 8 && g.dcar[mr] && g.dval[mr] == w.value) car = g.dcar[mr];
+        } else if (ran && w.size == 4 && win && win->reg >= 8 && win->v == w.value && in_ram(w.value))
+            car = exit_at(c.ipc, win->reg - 8, 'm');
+        else if (w.size == 4)
+            for (const InCar& k : incar) if (k.v == w.value) { car = k.id; break; }
         const uint32_t k = (w.addr & 0xFFFF) >> 1;
         g.ram[k] = t;
         if (w.size == 4) g.ram[(k + 1) & 0x7FFF] = t;
+        if (car && w.size == 4) {
+            g.mcar[k] = g.mcar[(k + 1) & 0x7FFF] = car;
+            g.mval[k] = g.mval[(k + 1) & 0x7FFF] = w.value;
+        }
+    }
+    // the data registers' carriers: an An's address put there, a carrier moved there whole; another value clears
+    // MOVEM.L to the registers: register r's value is its read number r (the list's registers below it)
+    auto movem_read = [&](int r) -> int {
+        if (!ran || (ir & 0xFFC0) != 0x4CC0 || g.ext.empty()) return -1;
+        const uint16_t list = uint16_t(g.ext[0].value);
+        int n = 0;
+        for (int b = 0; b < r; b++) n += list >> b & 1;
+        return n;
+    };
+    for (int i = 0; i < 8; i++) {
+        uint32_t car = dexit[i];
+        const int rd = movem_read(i);
+        if (!car && ran && g.named >> i & 1)
+            for (const InCar& k : incar) if (k.v == after[i] && (rd < 0 || k.read == rd)) { car = k.id; break; }
+        if (car) { g.dcar[i] = car; g.dval[i] = after[i]; }
+        else if (after[i] != g.before[i] || g.dval[i] != after[i]) g.dcar[i] = 0;
+    }
+    // an_writes: the sites this step writes A0-A6 at, and the sites their values are credited to from now on
+    if (ran) {
+        AW aw[8];
+        const int n = an_written(ir, aw);
+        std::vector<std::pair<const std::pair<uint32_t, int>, State::WSite>*> next[8];
+        int regs[8], m = 0;
+        for (int j = 0; j < n; j++) {
+            const AW& x = aw[j];
+            if (x.kind == 'a' && !fresh[8 + x.reg]) continue;   // the register's own value plus an offset
+            auto it = g.wsites.try_emplace({c.ipc & 0xFFFFFF, x.reg}).first;
+            State::WSite& s = it->second;
+            s.writes++;
+            s.kind = x.kind;
+            s.from = x.from;
+            auto& v = next[m];
+            v.push_back(&*it);
+            auto inherit = [&](int an) {           // the sites of the register it reads, before this step
+                for (auto* p : g.cred[an])
+                    if (v.size() < 16 && std::find(v.begin(), v.end(), p) == v.end()) v.push_back(p);
+            };
+            if (x.kind == 'a') inherit(x.reg);       // ADDA keeps the register's own sites (safe: more uses)
+            if (x.from >= 8 && x.from < 15) inherit(x.from - 8);
+            regs[m++] = x.reg;
+            // an exit's value back into an An (MOVEM: the register's own read)
+            const uint32_t v_after = after[8 + x.reg];
+            const int read = movem_read(8 + x.reg);
+            for (const InCar& k : incar)
+                if (k.v == v_after && (read < 0 || k.read == read)) {
+                    g.returns[{k.id, c.ipc & 0xFFFFFF, 'a', 8 + x.reg}]++;
+                    break;
+                }
+        }
+        for (int j = 0; j < m; j++) g.cred[regs[j]] = std::move(next[j]);
     }
     probe(c, ran, ir);
 }
@@ -382,7 +540,9 @@ bool taint_save(const char* path) {
     FILE* f = fopen(path, "wb");
     if (!f) return false;
     fprintf(f, "# mdkit taint 1: O ADDR SIZE PC VALUE FLAGS USES USE_PC; U PC COUNT WRITTEN_AT; A LOAD_PC REG USES USE_PC ORIGIN_ADDR ORIGIN_SIZE ORIGIN_PC; "
-               "H PC VIA ADDR SIZE COUNT; S PC VIA MIN MAX COUNT WRITTEN_AT; K PC COUNT LO HI JUMP VALUES; R PC COUNT COPY_PC ENCODINGS SOURCES (-: none); X PC AN TO COUNT (to: d, m, c) (via: 0 CPU, 1 DMA, 2 a stale local; flags: 1 to An, 2 work RAM base, "
+               "H PC VIA ADDR SIZE COUNT; S PC VIA MIN MAX COUNT WRITTEN_AT; K PC COUNT LO HI JUMP VALUES; R PC COUNT COPY_PC ENCODINGS SOURCES (-: none); X PC AN TO COUNT (to: d, m, c); "
+               "W PC AN KIND FROM WRITES USES USE_PC (kind: m i p c x d a l u; from: 8+n An, n Dn, -1); Y EXIT_PC AN TO WRITE_PC WRITE_AN COUNT; "
+               "E EXIT_PC AN TO RETURN_PC HOW REG COUNT (how: a into An, i an index; reg: 8+n An, n Dn) (via: 0 CPU, 1 DMA, 2 a stale local; flags: 1 to An, 2 work RAM base, "
                "4 compared with a work RAM address, 8 other base)%s", "\n");
     for (size_t i = 1; i < g.origins.size(); i++) {
         const Origin& o = g.origins[i];
@@ -414,6 +574,19 @@ bool taint_save(const char* path) {
     }
     for (auto& [k, n] : g.exits)
         fprintf(f, "X %06X %d %c %llu%s", std::get<0>(k), std::get<1>(k), std::get<2>(k), (unsigned long long)n, "\n");
+    for (auto& [k, s] : g.wsites)
+        fprintf(f, "W %06X %d %c %d %llu %llu %06X%s", k.first, k.second, s.kind, s.from, (unsigned long long)s.writes,
+                (unsigned long long)s.uses, s.use_pc, "\n");
+    for (auto& [k, n] : g.exit_writers) {
+        const auto& e = g.exit_keys[k.first - 1];
+        fprintf(f, "Y %06X %d %c %06X %d %llu%s", std::get<0>(e), std::get<1>(e), std::get<2>(e), k.second.first,
+                k.second.second, (unsigned long long)n, "\n");
+    }
+    for (auto& [k, n] : g.returns) {
+        const auto& e = g.exit_keys[std::get<0>(k) - 1];
+        fprintf(f, "E %06X %d %c %06X %c %d %llu%s", std::get<0>(e), std::get<1>(e), std::get<2>(e), std::get<1>(k),
+                std::get<2>(k), std::get<3>(k), (unsigned long long)n, "\n");
+    }
     for (auto& [pc, s] : g.stack_loads) {
         fprintf(f, "K %06X %llu %08X %08X %X ", pc, (unsigned long long)s.count, s.lo, s.hi, s.jump);
         bool first = true;

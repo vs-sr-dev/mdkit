@@ -36,10 +36,27 @@ order of md.h's IoClass).  The JSON:
   word or the immediate, as in ram_pointers and immediates; none: made from no ROM word);
 - "unattributed": PCs that formed a work RAM address from a register no ROM word reached, and
   the PC that last wrote that register ("written_at"; $FFFFFF: an exception's entry);
-- "an_exits": the complement of an_loads -- every instruction that took a work RAM address out of
-  an address register: into a data register ("data": move.l An,Dn, exg), to memory ("memory":
-  move.l An,(..), movem, pea (An)), or compared ("compare": cmp.l An,Dn); its PC and text, the
-  register, how many times;
+- "an_writes": every instruction that wrote A0-A6 (A7 is stack_loads'), known by its encoding,
+  not by the value -- movem.l (A7)+ restoring a register with the value it has is a write: its
+  PC and text, the register, the kind (memory: MOVEA, MOVEM, UNLK from memory, the stack
+  included; immediate: MOVEA #, LEA abs; pc_relative: LEA; copy: MOVEA An, LEA off another An;
+  exg; data: MOVEA Dn; add: ADDA/SUBA whose value is not the register's own plus an offset;
+  link; usp), the register it reads ("source": A3, D0, A7 for a copy, exg, data, add, link),
+  how many times ("writes"), how many work RAM addresses the value it wrote formed before the
+  register was written again ("ram_uses"; 0: written, never an address in work RAM) and the
+  first PC that formed one ("first_use_pc"), and how many times that value left the register
+  ("exits": data, memory, compare, as in an_exits; a value that only bounds a loop is a
+  compare).  A copy (and an ADDA) credits its uses to its own site and to the sites of the
+  register it reads, as an_loads does; an offset or increment of a register into itself (lea
+  d(An),An, addq, (An)+) is not a write and keeps the sites;
+- "an_exits": the complement of an_writes -- every instruction that took a work RAM address out of
+  an address register: into a data register ("data": move.l An,Dn, exg Dx,Ay), to memory
+  ("memory": move.l An,(..), movem -- each slot by its place in the list --, pea (An)), or
+  compared ("compare": cmp.l An,Dn); its PC and text, the register, how many times; the
+  an_writes sites whose value it was ("writers": pc, reg, count); and where the value came back
+  ("returns": pc, text, how -- "an": into an address register, "reg" which; "index": a data
+  register holding it was the index of a work RAM address --, count), followed while it moves
+  whole through data registers and longs of the work RAM (a word of it is not followed);
 - "header_reads": every read of the header's first long, $100-$103, which a port that puts
   its own vector there has to serve with the original bytes: the PC and text, the address and
   size read, the operand's addressing mode, "cpu" or "dma", how many times;
@@ -201,6 +218,7 @@ def pointers(data, prog, covers):
 def read_probes(paths):
     """The probes' records of one or more .taint files (md_taint.h), merged as tools/cover.py merges them."""
     header, sub, stack, ram_pcs, exits = Counter(), {}, {}, {}, Counter()
+    writes, writers, returns = {}, Counter(), Counter()
     for p in paths:
         if not os.path.exists(p):
             continue
@@ -236,17 +254,33 @@ def read_probes(paths):
                 o[3] |= {None if v == '-' else int(v, 16) for v in w[5].split(',')}
             elif w[0] == 'X':
                 exits[(int(w[1], 16), int(w[2]), w[3])] += int(w[4])
-    return header, sub, stack, ram_pcs, exits
+            elif w[0] == 'W':
+                o = writes.setdefault((int(w[1], 16), int(w[2])), [w[3], int(w[4]), 0, 0, 0])
+                o[2] += int(w[5])
+                o[3] += int(w[6])
+                o[4] = o[4] or int(w[7], 16)
+            elif w[0] == 'Y':
+                writers[(int(w[1], 16), int(w[2]), w[3], int(w[4], 16), int(w[5]))] += int(w[6])
+            elif w[0] == 'E':
+                returns[(int(w[1], 16), int(w[2]), w[3], int(w[4], 16), w[5], int(w[6]))] += int(w[7])
+    return header, sub, stack, ram_pcs, exits, (writes, writers, returns)
 
 
 VIA = ('cpu', 'dma', 'stale_local')
 TO = dict(d='data', m='memory', c='compare')
+KIND = dict(m='memory', i='immediate', p='pc_relative', c='copy', x='exg', d='data', a='add', l='link', u='usp')
+HOW = dict(a='an', i='index')
+
+
+def reg_name(r):
+    """The tracer's register number: 0-7 D0-D7, 8-15 A0-A7."""
+    return None if r < 0 else f'D{r}' if r < 8 else f'A{r - 8}'
 
 
 def probes(data, prog, covers, ram_groups):
-    """header_reads, sub_sp_reads, stack_loads, an_exits and the origin of each group of ram_code."""
+    """header_reads, sub_sp_reads, stack_loads, an_exits, an_writes and the origin of each group of ram_code."""
     from mdkit import m68k
-    header, sub, stack, ram_pcs, exits = read_probes([cv + '.taint' for cv in covers])
+    header, sub, stack, ram_pcs, exits, (writes, writers, returns) = read_probes([cv + '.taint' for cv in covers])
     read16 = m68k.reader(data)
 
     def insn(pc):
@@ -284,7 +318,20 @@ def probes(data, prog, covers, ram_groups):
         sp.append(rec)
     loads = [dict(pc=pc, text=text(pc), count=n, min=lo, max=hi, max_jump=jump, values=sorted(vals))
              for pc, (n, lo, hi, jump, vals) in sorted(stack.items())]
-    out = [dict(pc=pc, text=text(pc), reg=f'A{an}', to=TO[to], count=n) for (pc, an, to), n in sorted(exits.items())]
+    # an_exits, with the write sites whose value left (writers) and where it came back (returns)
+    ws, rs, site_exits = defaultdict(list), defaultdict(list), defaultdict(Counter)
+    for (pc, an, to, wpc, wan), n in sorted(writers.items()):
+        ws[(pc, an, to)].append(dict(pc=wpc, reg=f'A{wan}', count=n))
+        site_exits[(wpc, wan)][TO[to]] += n
+    for (pc, an, to, rpc, how, reg), n in sorted(returns.items()):
+        rs[(pc, an, to)].append(dict(pc=rpc, text=text(rpc), how=HOW[how], reg=reg_name(reg), count=n))
+    out = [dict(pc=pc, text=text(pc), reg=f'A{an}', to=TO[to], count=n,
+                writers=sorted(ws[(pc, an, to)], key=lambda w: -w['count']), returns=rs[(pc, an, to)])
+           for (pc, an, to), n in sorted(exits.items())]
+    an_writes = [dict(pc=pc, text=text(pc), reg=f'A{an}', kind=KIND[kind], source=reg_name(frm), writes=n,
+                      ram_uses=u, first_use_pc=upc or None,
+                      exits={k: site_exits[(pc, an)][k] for k in ('data', 'memory', 'compare')})
+                 for (pc, an), (kind, frm, n, u, upc) in sorted(writes.items())]
     groups = []
     for first, last in ram_groups:
         pcs = [p for p in sorted(ram_pcs) if first <= p <= last]
@@ -300,7 +347,7 @@ def probes(data, prog, covers, ram_groups):
         groups.append(dict(first=first, last=last, executed=sum(ram_pcs[p][0] for p in pcs), source=how, rom=rom,
                            copy_pcs=sorted({ram_pcs[p][1] for p in pcs} - {0}), stable=variants <= 1,
                            variants=variants))
-    return hdr, sp, loads, out, groups
+    return hdr, sp, loads, out, groups, an_writes
 
 
 def z80_code(covers):
@@ -383,7 +430,7 @@ def export(rom_path, covers):
             ram_groups[-1][1] = a
         else:
             ram_groups.append([a, a])
-    header_reads, sub_sp_reads, stack_loads, an_exits, ram_origin = probes(data, prog, covers, ram_groups)
+    header_reads, sub_sp_reads, stack_loads, an_exits, ram_origin, an_writes = probes(data, prog, covers, ram_groups)
     return dict(
         cart=dict(key=c.key, title=c.title, machine=c.machine, slot=c.slot, size=c.size,
                   crc32=f'{zlib.crc32(data):08X}'),
@@ -398,6 +445,7 @@ def export(rom_path, covers):
         ram_pointers=ram_pointers,
         immediates=immediates,
         an_loads=an_loads,
+        an_writes=an_writes,
         unattributed=unattributed,
         an_exits=an_exits,
         header_reads=header_reads,

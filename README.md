@@ -145,15 +145,20 @@ python tools/z80_families.py --write-exports                  # the Z80 drivers,
   to the VDP, with how deep, and every read of a stale local -- a byte
   that has been under the stack pointer since it was last written (the
   reads CLR, Scc and MOVE from SR make and drop are not counted); every
-  instruction that loads A7 itself (a task's stack); and where the code
+  instruction that loads A7 itself (a task's stack); where the code
   run from the work RAM came from -- the ROM bytes it copies and the
   instruction that copied them, or none (decompressed, built) -- and
-  whether it is rewritten while it runs.
+  whether it is rewritten while it runs; every instruction that writes
+  A0-A6, known by its encoding (a `movem.l (A7)+` that puts back the
+  value a register had writes it), and how many work RAM addresses the
+  value it wrote formed before the register was written again; and
+  every work RAM address that leaves an address register, followed
+  through data registers and memory to where it comes back.
 - `tools/cover.py`: runs the tracer several times (tapes, the hand with
   seeds 1-3, the attract mode with no input) and keeps their union as
   `trace.cov` (and `.sites`, `.taint`, `.z80`), the runs in `runs/` and
   `runs.json`, and writes `export.json` from it with `ram_pointers`,
-  `immediates`, `an_loads`, `an_exits`, `unattributed`, `header_reads`,
+  `immediates`, `an_loads`, `an_writes`, `an_exits`, `unattributed`, `header_reads`,
   `sub_sp_reads`, `stack_loads`, `ram_code` (with its origin), `z80_code`
   and `runs`. Runs
   made before (a cart's tapes) stay in the union when the library's are
