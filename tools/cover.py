@@ -68,7 +68,7 @@ def merge(runs_dir, names, out_cov):
     """The union of the runs' files as out_cov, .sites and .taint; each run's own count."""
     pcs, sites, origins, unattr, z80, loads = set(), {}, {}, {}, {}, {}
     header, sub, stack, ram_pcs, exits = {}, {}, {}, {}, {}
-    writes, writers, returns = {}, {}, {}
+    writes, writers, returns, jumps = {}, {}, {}, {}
     per_run = {}
     for n in names:
         p = os.path.join(runs_dir, n + '.cov')
@@ -133,12 +133,18 @@ def merge(runs_dir, names, out_cov):
                 elif w[0] == 'X':                   # an address register's RAM address out: PC AN TO COUNT
                     k = tuple(w[1:4])
                     exits[k] = exits.get(k, 0) + int(w[4])
-                elif w[0] == 'W':                   # an An written: PC AN KIND FROM WRITES USES USE_PC
-                    o = writes.setdefault((w[1], w[2]), [w[3], w[4], 0, 0, '000000'])
+                elif w[0] == 'W':                   # an An written: PC AN KIND FROM WRITES USES USE_PC, then
+                    # SWAP_VALUES RAM_PARTNER OTHER SWAP_D SWAP_M SWAP_C SWAP_A (0 from a tracer before them)
+                    o = writes.setdefault((w[1], w[2]), [w[3], w[4], 0, 0, '000000', [0] * 7])
                     o[2] += int(w[5])
                     o[3] += int(w[6])
                     if o[4] == '000000' and int(w[6]):
                         o[4] = w[7]
+                    for i, v in enumerate(w[8:15]):
+                        o[5][i] += int(v)
+                elif w[0] == 'J':                   # an indirect jump's target: PC TARGET COUNT
+                    k = (w[1], w[2])
+                    jumps[k] = jumps.get(k, 0) + int(w[3])
                 elif w[0] == 'Y':                   # an exit's writers: EXIT_PC AN TO WRITE_PC WRITE_AN COUNT
                     k = tuple(w[1:6])
                     writers[k] = writers.get(k, 0) + int(w[6])
@@ -157,7 +163,8 @@ def merge(runs_dir, names, out_cov):
         f.write('# mdkit taint 1 (merged): O ADDR SIZE PC VALUE FLAGS USES USE_PC; U PC COUNT WRITTEN_AT; '
                 'A LOAD_PC REG USES USE_PC ORIGIN_ADDR ORIGIN_SIZE ORIGIN_PC; H PC VIA ADDR SIZE COUNT; '
                 'S PC VIA MIN MAX COUNT WRITTEN_AT; K PC COUNT LO HI JUMP VALUES; '
-                'R PC COUNT COPY_PC ENCODINGS SOURCES; X PC AN TO COUNT; W PC AN KIND FROM WRITES USES USE_PC; '
+                'R PC COUNT COPY_PC ENCODINGS SOURCES; X PC AN TO COUNT; W PC AN KIND FROM WRITES USES USE_PC '
+                'SWAP_VALUES RAM_PARTNER OTHER SWAP_D SWAP_M SWAP_C SWAP_A; J PC TARGET COUNT; '
                 'Y EXIT_PC AN TO WRITE_PC WRITE_AN COUNT; E EXIT_PC AN TO RETURN_PC HOW REG COUNT\n')
         for (a, s, pc), (v, fl, u, upc) in sorted(origins.items()):
             f.write(f'O {a} {s} {pc} {v} {fl:X} {u} {upc}\n')
@@ -176,8 +183,10 @@ def merge(runs_dir, names, out_cov):
             f.write(f'R {pc} {n} {copy} {",".join(sorted(enc))} {",".join(sorted(srcs))}\n')
         for k, n in sorted(exits.items()):
             f.write(f'X {" ".join(k)} {n}\n')
-        for (pc, an), (kind, frm, n, u, upc) in sorted(writes.items()):
-            f.write(f'W {pc} {an} {kind} {frm} {n} {u} {upc}\n')
+        for (pc, an), (kind, frm, n, u, upc, more) in sorted(writes.items()):
+            f.write(f'W {pc} {an} {kind} {frm} {n} {u} {upc} {" ".join(map(str, more))}\n')
+        for (pc, t), n in sorted(jumps.items()):
+            f.write(f'J {pc} {t} {n}\n')
         for k, n in sorted(writers.items()):
             f.write(f'Y {" ".join(k)} {n}\n')
         for k, n in sorted(returns.items()):

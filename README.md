@@ -151,9 +151,16 @@ python tools/z80_families.py --write-exports                  # the Z80 drivers,
   whether it is rewritten while it runs; every instruction that writes
   A0-A6, known by its encoding (a `movem.l (A7)+` that puts back the
   value a register had writes it), and how many work RAM addresses the
-  value it wrote formed before the register was written again; and
-  every work RAM address that leaves an address register, followed
-  through data registers and memory to where it comes back.
+  value it wrote formed before the register was written again --
+  with, for the Jaguar side's swap of an address's bits 16-23, how
+  many of its values the swap changes, where those left the register,
+  and how often the value met another address register in an
+  `adda.l`/`suba.l`/`cmpa.l` (and whether that one was a work RAM
+  address); every work RAM address that leaves an address register
+  (into a data register, to memory, into a compare or a sum),
+  followed through data registers and memory to where it comes back;
+  and the targets each `jmp`/`jsr` through a register or a
+  `(d8,PC,Xn)` table took.
 - `tools/cover.py`: runs the tracer several times (tapes, the hand with
   seeds 1-3, the attract mode with no input) and keeps their union as
   `trace.cov` (and `.sites`, `.taint`, `.z80`), the runs in `runs/` and
@@ -201,6 +208,15 @@ A7 from one instruction with more than one value, a stack per task
 switches). The 347 carts' code in RAM is 944 groups: 296 copied from the
 ROM as they are, 449 written from no ROM bytes (decompressed or built),
 198 mixed; in 166 carts some of it is rewritten while it runs.
+The Jaguar side swaps bits 16-23 of the work RAM's addresses (`$FF` and
+`$1F`, `$FE` and `$1E`): of the 596,147 instructions that load an address
+register from memory, a data register or `exg`, 239,144 never wrote a
+value the swap changes (1.77 of 5.42 billion loads), and 27,153 sites'
+values met another address register in an `adda.l`, `suba.l` or
+`cmpa.l` (17,011 of them one holding a work RAM address). Of 118,350
+`jmp` and `jsr` through a register or a `(d8,PC,Xn)` table, 79,380 were
+taken, to 313,156 targets (Sonic 1's object loop, `jsr (A1)` at `$D354`:
+127 routines).
 
 ## The library
 

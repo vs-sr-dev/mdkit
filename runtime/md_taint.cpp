@@ -71,7 +71,13 @@ struct State {
     // write), keyed (PC, register); the sites each register's value is credited to (the last writer, and
     // the sites of the register a copy or an ADDA reads); every work RAM address the register forms is a use
     // of each of them
-    struct WSite { uint64_t writes = 0, uses = 0; uint32_t use_pc = 0; char kind = 0; int from = -1; };
+    // swap_values: writes whose value Prowl's swap changes (bits 16-23 $1E, $1F, $FE, $FF); ram_partner, other:
+    // the value an operand of ADDA.L/SUBA.L/CMPA.L An,Am with the other a work RAM address or not; swap_exits:
+    // its exits (data, memory, compare, add) with a value in the swap's domain
+    struct WSite {
+        uint64_t writes = 0, uses = 0; uint32_t use_pc = 0; char kind = 0; int from = -1;
+        uint64_t swap_values = 0, ram_partner = 0, other = 0, swap_exits[4] = {};
+    };
     std::map<std::pair<uint32_t, int>, WSite> wsites;
     std::vector<std::pair<const std::pair<uint32_t, int>, WSite>*> cred[7];
     // the exits' carriers: an An's work RAM address once it left (to a Dn, to a long of the RAM), followed
@@ -82,11 +88,15 @@ struct State {
     std::vector<uint32_t> mcar = std::vector<uint32_t>(0x8000, 0), mval = std::vector<uint32_t>(0x8000, 0);
     std::map<std::tuple<uint32_t, uint32_t, char, int>, uint64_t> returns;   // (carrier, PC, 'a' An / 'i' index, reg)
     std::map<std::pair<uint32_t, std::pair<uint32_t, int>>, uint64_t> exit_writers;   // (carrier, write site)
+    // the targets of JMP and JSR through a register or (d8,PC,Xn): (PC, target) -> times
+    std::map<std::pair<uint32_t, uint32_t>, uint64_t> jumps;
 };
 State g;
 
 // a work RAM address: $E00000-$FFFFFF, its top byte $00 or $FF as games write them ($07FF0000 is a number)
 bool in_ram(uint32_t v) { return (v & 0xFFFFFF) >= 0xE00000 && ((v >> 24) == 0 || (v >> 24) == 0xFF); }
+// a value Prowl's swap changes (fixa, unfixa: bits 16-23 $FF<->$1F, $FE<->$1E), whatever its top byte
+bool swapped(uint32_t v) { const uint32_t b = (v >> 16) & 0xFF; return b == 0x1E || b == 0x1F || b == 0xFE || b == 0xFF; }
 bool in_rom(const State& s, uint32_t a) { a &= 0xFFFFFF; return a < s.rom_size && a < 0x400000; }
 
 // the probes: an address of the work RAM (24 bits, mirrors included) and how far under the stack pointer
@@ -169,7 +179,7 @@ int score(const Cand& k, uint32_t v, int width, const uint32_t* old, uint32_t& d
 }
 
 uint32_t best(const std::vector<Cand>& cands, uint32_t v, int width, const uint32_t* old, int* quality = nullptr,
-              int target = -1, const Cand** winner = nullptr) {
+              int target = -1, const Cand** winner = nullptr, bool tag = true) {
     int bq = 0, bp = -1;
     uint32_t bd = 0;
     const Cand* b = nullptr;
@@ -181,7 +191,7 @@ uint32_t best(const std::vector<Cand>& cands, uint32_t v, int width, const uint3
     }
     if (quality) *quality = bq;
     if (winner) *winner = b;
-    return b ? cand_tag(*b) : 0;
+    return b && tag ? cand_tag(*b) : 0;
 }
 
 void mark(uint32_t tag, uint32_t flag) {
@@ -310,6 +320,16 @@ uint32_t exit_at(uint32_t pc, int an, char to) {
     return it->second;
 }
 
+// a value leaving An (to: 'd' a data register, 'm' memory, 'c' compared, 'a' added to a data register): an exit
+// when it is a work RAM address (its carrier id, else 0), a swap exit of An's sites when the swap changes it
+uint32_t leave(uint32_t pc, int an, char to, uint32_t v) {
+    if (an < 7 && swapped(v)) {
+        const int k = to == 'd' ? 0 : to == 'm' ? 1 : to == 'c' ? 2 : 3;
+        for (auto* s : g.cred[an]) s->second.swap_exits[k]++;
+    }
+    return in_ram(v) ? exit_at(pc, an, to) : 0;
+}
+
 }  // namespace
 
 void taint_attach(M68K* c, uint32_t rom_size) {
@@ -404,8 +424,27 @@ void taint_end(M68K& c) {
         if (n >= 2)
             for (const Cand& k : cands)
                 if (in_ram(word_a && k.size == 2 ? uint32_t(sext16(k.v)) : k.v)) mark(cand_tag(k), TAINT_RAM_CMP);
-        for (const Cand& k : cands)
-            if (k.reg >= 8 && k.reg < 15 && in_ram(k.v)) exit_at(c.ipc, k.reg - 8, 'c');
+    }
+    // an address register compared, by the encoding (an An that only forms the address of an operand, cmp.l (A3),D1,
+    // is not): CMPA's destination, and the source of CMPA and CMP.L when it is An itself
+    if (ran) {
+        const int r9 = (ir >> 9) & 7, mode = (ir >> 3) & 7, r0 = ir & 7;
+        const bool cmpa = (ir & 0xF0C0) == 0xB0C0, cmpl = (ir & 0xF1C0) == 0xB080;
+        if (cmpa && r9 != 7) leave(c.ipc, r9, 'c', g.before[8 + r9]);
+        if ((cmpa || cmpl) && mode == 1 && r0 != 7 && !(cmpa && r0 == r9)) leave(c.ipc, r0, 'c', g.before[8 + r0]);
+        // ADD.L/SUB.L An,Dn: the value leaves into a sum
+        if ((ir & 0xB1F8) == 0x9088) leave(c.ipc, r0, 'a', g.before[8 + r0]);
+        // ADDA.L/SUBA.L/CMPA.L An,Am: each operand's sites, by whether the other is a work RAM address
+        if ((ir & 0xB1F8) == 0x91C8 || (ir & 0xF1F8) == 0xB1C8)
+            for (int i = 0; i < 2; i++) {                // adda.l A0,A0: A0 once, its partner itself
+                const int x = i ? r9 : r0;
+                if (x == 7 || (i && r9 == r0)) continue;
+                const bool ram = in_ram(g.before[8 + (x == r0 ? r9 : r0)]);
+                for (auto* s : g.cred[x]) (ram ? s->second.ram_partner : s->second.other)++;
+            }
+        // JMP, JSR through a register or (d8,PC,Xn): the target
+        if ((ir & 0xFF80) == 0x4E80 && (mode == 2 || mode == 5 || mode == 6 || (mode == 7 && r0 == 3)))
+            g.jumps[{c.ipc & 0xFFFFFF, c.pc & 0xFFFFFF}]++;
     }
     // the exits' carriers the step reads: a long of the work RAM (as read), a data register it names
     struct InCar { uint32_t v, id; int read; };
@@ -447,8 +486,8 @@ void taint_end(M68K& c) {
     }
     // an An's work RAM address put whole into a data register: MOVE.L An,Dn, EXG Dx,Ay (by the encoding: a
     // result equal to a named An by chance, not.w d1 with A3 = $FFFFFFF0, is not one)
-    if (ran && ((ir & 0xF1F8) == 0x2008 || (ir & 0xF1F8) == 0xC188) && in_ram(g.before[8 + (ir & 7)]))
-        dexit[(ir >> 9) & 7] = exit_at(c.ipc, ir & 7, 'd');
+    if (ran && ((ir & 0xF1F8) == 0x2008 || (ir & 0xF1F8) == 0xC188))
+        dexit[(ir >> 9) & 7] = leave(c.ipc, ir & 7, 'd', g.before[8 + (ir & 7)]);
     // the work RAM written; the carriers in it: any write clears its words' carriers, a long sets them
     for (const Access& w : g.pwrites)
         if (wram(w.addr))
@@ -460,20 +499,23 @@ void taint_end(M68K& c) {
         for (int i = 0; i < 16; i++)
             if (list >> i & 1) mregs.push_back(((ir >> 3) & 7) == 4 ? 15 - i : i);
     }
+    // (a long to anywhere is an exit, the I/O and the SRAM included; the work RAM alone keeps tags and carriers)
     for (size_t j = 0; j < g.writes.size(); j++) {
         const Access& w = g.writes[j];
-        if (!in_ram(w.addr)) continue;
+        const bool ramw = in_ram(w.addr);
+        if (!ramw && (w.size != 4 || !ran)) continue;
         const Cand* win = nullptr;
-        const uint32_t t = best(cands, w.value, w.size, nullptr, nullptr, -1, &win);
+        const uint32_t t = best(cands, w.value, w.size, nullptr, nullptr, -1, &win, ramw);
         uint32_t car = 0;
         const int mr = j < mregs.size() ? mregs[j] : -1;
         if (mr >= 0) {
-            if (w.size == 4 && mr >= 8 && g.before[mr] == w.value && in_ram(w.value)) car = exit_at(c.ipc, mr - 8, 'm');
+            if (w.size == 4 && mr >= 8 && g.before[mr] == w.value) car = leave(c.ipc, mr - 8, 'm', w.value);
             else if (w.size == 4 && mr < 8 && g.dcar[mr] && g.dval[mr] == w.value) car = g.dcar[mr];
-        } else if (ran && w.size == 4 && win && win->reg >= 8 && win->v == w.value && in_ram(w.value))
-            car = exit_at(c.ipc, win->reg - 8, 'm');
+        } else if (ran && w.size == 4 && win && win->reg >= 8 && win->v == w.value)
+            car = leave(c.ipc, win->reg - 8, 'm', w.value);
         else if (w.size == 4)
             for (const InCar& k : incar) if (k.v == w.value) { car = k.id; break; }
+        if (!ramw) continue;
         const uint32_t k = (w.addr & 0xFFFF) >> 1;
         g.ram[k] = t;
         if (w.size == 4) g.ram[(k + 1) & 0x7FFF] = t;
@@ -511,6 +553,7 @@ void taint_end(M68K& c) {
             auto it = g.wsites.try_emplace({c.ipc & 0xFFFFFF, x.reg}).first;
             State::WSite& s = it->second;
             s.writes++;
+            if (swapped(after[8 + x.reg])) s.swap_values++;
             s.kind = x.kind;
             s.from = x.from;
             auto& v = next[m];
@@ -540,8 +583,9 @@ bool taint_save(const char* path) {
     FILE* f = fopen(path, "wb");
     if (!f) return false;
     fprintf(f, "# mdkit taint 1: O ADDR SIZE PC VALUE FLAGS USES USE_PC; U PC COUNT WRITTEN_AT; A LOAD_PC REG USES USE_PC ORIGIN_ADDR ORIGIN_SIZE ORIGIN_PC; "
-               "H PC VIA ADDR SIZE COUNT; S PC VIA MIN MAX COUNT WRITTEN_AT; K PC COUNT LO HI JUMP VALUES; R PC COUNT COPY_PC ENCODINGS SOURCES (-: none); X PC AN TO COUNT (to: d, m, c); "
-               "W PC AN KIND FROM WRITES USES USE_PC (kind: m i p c x d a l u; from: 8+n An, n Dn, -1); Y EXIT_PC AN TO WRITE_PC WRITE_AN COUNT; "
+               "H PC VIA ADDR SIZE COUNT; S PC VIA MIN MAX COUNT WRITTEN_AT; K PC COUNT LO HI JUMP VALUES; R PC COUNT COPY_PC ENCODINGS SOURCES (-: none); X PC AN TO COUNT (to: d, m, c, a); "
+               "W PC AN KIND FROM WRITES USES USE_PC SWAP_VALUES RAM_PARTNER OTHER SWAP_D SWAP_M SWAP_C SWAP_A "
+               "(kind: m i p c x d a l u; from: 8+n An, n Dn, -1); J PC TARGET COUNT; Y EXIT_PC AN TO WRITE_PC WRITE_AN COUNT; "
                "E EXIT_PC AN TO RETURN_PC HOW REG COUNT (how: a into An, i an index; reg: 8+n An, n Dn) (via: 0 CPU, 1 DMA, 2 a stale local; flags: 1 to An, 2 work RAM base, "
                "4 compared with a work RAM address, 8 other base)%s", "\n");
     for (size_t i = 1; i < g.origins.size(); i++) {
@@ -575,8 +619,12 @@ bool taint_save(const char* path) {
     for (auto& [k, n] : g.exits)
         fprintf(f, "X %06X %d %c %llu%s", std::get<0>(k), std::get<1>(k), std::get<2>(k), (unsigned long long)n, "\n");
     for (auto& [k, s] : g.wsites)
-        fprintf(f, "W %06X %d %c %d %llu %llu %06X%s", k.first, k.second, s.kind, s.from, (unsigned long long)s.writes,
-                (unsigned long long)s.uses, s.use_pc, "\n");
+        fprintf(f, "W %06X %d %c %d %llu %llu %06X %llu %llu %llu %llu %llu %llu %llu%s", k.first, k.second, s.kind, s.from,
+                (unsigned long long)s.writes, (unsigned long long)s.uses, s.use_pc, (unsigned long long)s.swap_values,
+                (unsigned long long)s.ram_partner, (unsigned long long)s.other, (unsigned long long)s.swap_exits[0],
+                (unsigned long long)s.swap_exits[1], (unsigned long long)s.swap_exits[2],
+                (unsigned long long)s.swap_exits[3], "\n");
+    for (auto& [k, n] : g.jumps) fprintf(f, "J %06X %06X %llu%s", k.first, k.second, (unsigned long long)n, "\n");
     for (auto& [k, n] : g.exit_writers) {
         const auto& e = g.exit_keys[k.first - 1];
         fprintf(f, "Y %06X %d %c %06X %d %llu%s", std::get<0>(e), std::get<1>(e), std::get<2>(e), k.second.first,

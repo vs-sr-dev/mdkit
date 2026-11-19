@@ -18,7 +18,10 @@ order of md.h's IoClass).  The JSON:
   it names: work RAM ($FF0000, and its mirrors from $E00000), the VDP, the Z80 side, I/O...
   -- the Jaguar's RAM sits at $000000 and its ROM at $800000;
 - "indirect": JMP and JSR through a register, and the jump tables reached by
-  (d8,PC,Xn): the places a translator must resolve or keep a lookup for;
+  (d8,PC,Xn): the places a translator must resolve or keep a lookup for.  Each JMP and JSR
+  has the targets the runs took ("targets": pc, count, the most taken first; [] if never
+  run); one the runs took outside the discovered code is listed with kind "ram" (run from
+  the work RAM: no text) or "unlisted";
 - "special": TAS, MOVEP, STOP, RESET, TRAP, illegal and line-A/F words among the code;
 - "ram_pointers": from FILE.taint (build/md_taint.exe, runtime/md_taint.h): every word or long
   read from the ROM's data whose value the run used as an address in work RAM -- the base or
@@ -45,14 +48,22 @@ order of md.h's IoClass).  The JSON:
   how many times ("writes"), how many work RAM addresses the value it wrote formed before the
   register was written again ("ram_uses"; 0: written, never an address in work RAM) and the
   first PC that formed one ("first_use_pc"), and how many times that value left the register
-  ("exits": data, memory, compare, as in an_exits; a value that only bounds a loop is a
-  compare).  A copy (and an ADDA) credits its uses to its own site and to the sites of the
-  register it reads, as an_loads does; an offset or increment of a register into itself (lea
-  d(An),An, addq, (An)+) is not a write and keeps the sites;
+  ("exits": data, memory, compare, add, as in an_exits; a value that only bounds a loop is a
+  compare).  For the Jaguar side's swap of bits 16-23 ($FF<->$1F, $FE<->$1E, any top byte):
+  how many of the writes had a value the swap changes ("swap_values": at 0 a fixup there is
+  the identity), and the value's exits counted as "exits" are but for each value the swap
+  changes, a work RAM address or not ("swap_exits"); and how many times the value was an
+  operand of adda.l/suba.l/cmpa.l An,Am ("arith": "ram_partner" when the other operand was a
+  work RAM address, else "other").  A copy (and an ADDA) credits its uses, exits and arith to
+  its own site and to the sites of the register it reads, as an_loads does; an offset or
+  increment of a register into itself (lea d(An),An, addq, (An)+) is not a write and keeps the
+  sites;
 - "an_exits": the complement of an_writes -- every instruction that took a work RAM address out of
   an address register: into a data register ("data": move.l An,Dn, exg Dx,Ay), to memory
-  ("memory": move.l An,(..), movem -- each slot by its place in the list --, pea (An)), or
-  compared ("compare": cmp.l An,Dn); its PC and text, the register, how many times; the
+  anywhere ("memory": move.l An,(..), movem -- each slot by its place in the list --, pea
+  (An)), compared ("compare": cmpa's destination, cmpa's and cmp.l's source when it is An
+  itself -- not an An that only addresses an operand, cmp.l (A3),D1), or into a sum ("add":
+  add.l/sub.l An,Dn); its PC and text, the register, how many times; the
   an_writes sites whose value it was ("writers": pc, reg, count); and where the value came back
   ("returns": pc, text, how -- "an": into an address register, "reg" which; "index": a data
   register holding it was the index of a work RAM address --, count), followed while it moves
@@ -218,7 +229,7 @@ def pointers(data, prog, covers):
 def read_probes(paths):
     """The probes' records of one or more .taint files (md_taint.h), merged as tools/cover.py merges them."""
     header, sub, stack, ram_pcs, exits = Counter(), {}, {}, {}, Counter()
-    writes, writers, returns = {}, Counter(), Counter()
+    writes, writers, returns, jumps = {}, Counter(), Counter(), Counter()
     for p in paths:
         if not os.path.exists(p):
             continue
@@ -255,19 +266,23 @@ def read_probes(paths):
             elif w[0] == 'X':
                 exits[(int(w[1], 16), int(w[2]), w[3])] += int(w[4])
             elif w[0] == 'W':
-                o = writes.setdefault((int(w[1], 16), int(w[2])), [w[3], int(w[4]), 0, 0, 0])
+                o = writes.setdefault((int(w[1], 16), int(w[2])), [w[3], int(w[4]), 0, 0, 0, [0] * 7])
                 o[2] += int(w[5])
                 o[3] += int(w[6])
                 o[4] = o[4] or int(w[7], 16)
+                for i, v in enumerate(w[8:15]):     # absent from a tracer before them
+                    o[5][i] += int(v)
+            elif w[0] == 'J':
+                jumps[(int(w[1], 16), int(w[2], 16))] += int(w[3])
             elif w[0] == 'Y':
                 writers[(int(w[1], 16), int(w[2]), w[3], int(w[4], 16), int(w[5]))] += int(w[6])
             elif w[0] == 'E':
                 returns[(int(w[1], 16), int(w[2]), w[3], int(w[4], 16), w[5], int(w[6]))] += int(w[7])
-    return header, sub, stack, ram_pcs, exits, (writes, writers, returns)
+    return header, sub, stack, ram_pcs, exits, (writes, writers, returns), jumps
 
 
 VIA = ('cpu', 'dma', 'stale_local')
-TO = dict(d='data', m='memory', c='compare')
+TO = dict(d='data', m='memory', c='compare', a='add')
 KIND = dict(m='memory', i='immediate', p='pc_relative', c='copy', x='exg', d='data', a='add', l='link', u='usp')
 HOW = dict(a='an', i='index')
 
@@ -278,9 +293,11 @@ def reg_name(r):
 
 
 def probes(data, prog, covers, ram_groups):
-    """header_reads, sub_sp_reads, stack_loads, an_exits, an_writes and the origin of each group of ram_code."""
+    """header_reads, sub_sp_reads, stack_loads, an_exits, an_writes, the origin of each group of ram_code and the
+    indirect jumps' targets ({pc: [(target, count)]}, the most taken first)."""
     from mdkit import m68k
-    header, sub, stack, ram_pcs, exits, (writes, writers, returns) = read_probes([cv + '.taint' for cv in covers])
+    header, sub, stack, ram_pcs, exits, (writes, writers, returns), jumps = \
+        read_probes([cv + '.taint' for cv in covers])
     read16 = m68k.reader(data)
 
     def insn(pc):
@@ -328,10 +345,16 @@ def probes(data, prog, covers, ram_groups):
     out = [dict(pc=pc, text=text(pc), reg=f'A{an}', to=TO[to], count=n,
                 writers=sorted(ws[(pc, an, to)], key=lambda w: -w['count']), returns=rs[(pc, an, to)])
            for (pc, an, to), n in sorted(exits.items())]
+    exit_kinds = ('data', 'memory', 'compare', 'add')
     an_writes = [dict(pc=pc, text=text(pc), reg=f'A{an}', kind=KIND[kind], source=reg_name(frm), writes=n,
                       ram_uses=u, first_use_pc=upc or None,
-                      exits={k: site_exits[(pc, an)][k] for k in ('data', 'memory', 'compare')})
-                 for (pc, an), (kind, frm, n, u, upc) in sorted(writes.items())]
+                      exits={k: site_exits[(pc, an)][k] for k in exit_kinds},
+                      swap_values=more[0], swap_exits=dict(zip(exit_kinds, more[3:7])),
+                      arith=dict(ram_partner=more[1], other=more[2]))
+                 for (pc, an), (kind, frm, n, u, upc, more) in sorted(writes.items())]
+    targets = defaultdict(list)
+    for (pc, t), n in sorted(jumps.items(), key=lambda kv: (kv[0][0], -kv[1], kv[0][1])):
+        targets[pc].append((t, n))
     groups = []
     for first, last in ram_groups:
         pcs = [p for p in sorted(ram_pcs) if first <= p <= last]
@@ -347,7 +370,7 @@ def probes(data, prog, covers, ram_groups):
         groups.append(dict(first=first, last=last, executed=sum(ram_pcs[p][0] for p in pcs), source=how, rom=rom,
                            copy_pcs=sorted({ram_pcs[p][1] for p in pcs} - {0}), stable=variants <= 1,
                            variants=variants))
-    return hdr, sp, loads, out, groups, an_writes
+    return hdr, sp, loads, out, groups, an_writes, targets
 
 
 def z80_code(covers):
@@ -430,7 +453,19 @@ def export(rom_path, covers):
             ram_groups[-1][1] = a
         else:
             ram_groups.append([a, a])
-    header_reads, sub_sp_reads, stack_loads, an_exits, ram_origin, an_writes = probes(data, prog, covers, ram_groups)
+    header_reads, sub_sp_reads, stack_loads, an_exits, ram_origin, an_writes, targets = \
+        probes(data, prog, covers, ram_groups)
+    # each JMP/JSR's observed targets ([] for one the runs did not take); one from the work RAM, outside the
+    # discovered code, is listed too
+    listed = set()
+    for d in indirect:
+        if prog.code[d['pc']].mnem in ('jmp', 'jsr'):
+            d['targets'] = [dict(pc=t, count=n) for t, n in targets.get(d['pc'], [])]
+            listed.add(d['pc'])
+    for pc in sorted(set(targets) - listed):
+        i = prog.code.get(pc)
+        indirect.append(dict(pc=pc, text=i.text() if i else None, kind='ram' if pc >= 0xE00000 else 'unlisted',
+                             targets=[dict(pc=t, count=n) for t, n in targets[pc]]))
     return dict(
         cart=dict(key=c.key, title=c.title, machine=c.machine, slot=c.slot, size=c.size,
                   crc32=f'{zlib.crc32(data):08X}'),

@@ -37,10 +37,12 @@
 //     instruction run from the work RAM, its encodings (opcode and extension words: more than
 //     one is code rewritten) and where its bytes came from;
 //   - an address register's work RAM address leaving the address registers: to a data
-//     register (MOVE.L An,Dn, EXG Dx,Ay), to memory (a long equal to it; MOVEM's slots by
-//     their place in its list), or compared (CMP.L, CMPA).  The value that left is followed
-//     while it moves whole -- a data register, a long of the work RAM -- to where it comes
-//     back into an address register, or is an index of a work RAM address;
+//     register (MOVE.L An,Dn, EXG Dx,Ay), to memory (a long equal to it, anywhere; MOVEM's
+//     slots by their place in its list), compared (CMPA's destination, CMPA's and CMP.L's
+//     source when it is An itself: not an An that only addresses an operand), or added to a
+//     data register (ADD.L/SUB.L An,Dn).  The value that left is followed while it moves
+//     whole -- a data register, a long of the work RAM -- to where it comes back into an
+//     address register, or is an index of a work RAM address;
 //   - each instruction that writes A0-A6, known by its encoding rather than by the value
 //     (a MOVEM that puts back the value a register already has writes it): MOVEA, LEA, EXG,
 //     MOVEM, UNLK, LINK, MOVE USP, and ADDA/SUBA when the value is not the register's own
@@ -48,6 +50,11 @@
 //     and to the sites of the register a copy (MOVEA An, LEA off another An, EXG) or an ADDA
 //     reads; each work RAM address the register forms is a use of each of them.  Offsets
 //     and increments of a register into itself (LEA d(An),An, ADDQ, (An)+) are not writes.
+//     For the Jaguar side's swap (bits 16-23 $FF<->$1F, $FE<->$1E, any top byte) each site
+//     also counts the writes whose value the swap changes, its value's exits (as above) when
+//     the swap changes it -- a work RAM address or not --, and the times its value was an
+//     operand of ADDA.L/SUBA.L/CMPA.L An,Am, by whether the other was a work RAM address;
+//   - the targets of JMP and JSR through a register or (d8,PC,Xn), with the times each.
 #pragma once
 #include <cstdint>
 
